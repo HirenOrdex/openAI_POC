@@ -650,15 +650,11 @@ def strip_html_tags(text):
     return clean.strip()
 
 class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
-    def handle_send_invoice_sms(self):
+    def handle_send_invoice_sms(self, data):
         print("[SMS SERVICE] ===============================")
         print("[SMS SERVICE] Request received")
 
         try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
-            data = json.loads(body.decode("utf-8"))
-
             order_name = data.get("order_name")
             customer_name = data.get("customer_name", "Anonymous")
             phone_number = data.get("phone_number")
@@ -675,27 +671,20 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                     "message": "Phone number missing"
                 })
 
-            # âœ… Format phone (same logic)
             formatted_phone = (
                 phone_number
                 if phone_number.startswith("+")
                 else f"+972{phone_number[1:]}"
             )
 
-            print(f"[SMS SERVICE] Formatted phone: {formatted_phone}")
-
-            # âœ… Build message (same content)
             message = (
-                f"âœ… SUCCESS! Your order has been completed!\n"
+                f"✅ SUCCESS! Your order has been completed!\n"
                 f"Order: {order_name}\n"
                 f"Customer: {customer_name}"
             )
 
             if invoice_url:
-                message += f"\n\nðŸ“„ View your invoice (PDF):\n{invoice_url}"
-                print("[SMS SERVICE] Invoice URL included")
-            else:
-                print("[SMS SERVICE] No invoice URL provided")
+                message += f"\n\n📄 View your invoice (PDF):\n{invoice_url}"
 
             payload = {
                 "sms": {
@@ -705,9 +694,6 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                     "message": message
                 }
             }
-
-            print("[SMS SERVICE] Sending SMS to 019sms...")
-            print("[SMS SERVICE] Payload:", json.dumps(payload, ensure_ascii=False))
 
             headers = {
                 "Content-Type": "application/json",
@@ -721,20 +707,13 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 timeout=10
             )
 
-            print("[SMS SERVICE] API Status:", response.status_code)
-            print("[SMS SERVICE] API Response:", response.text)
-
             if response.status_code in (200, 201):
-                print("[SMS SERVICE] âœ… SMS sent successfully")
-
                 return self._json_response(200, {
                     "success": True,
                     "message": "SMS sent successfully",
                     "response": response.text,
                     "invoice_url": invoice_url
                 })
-
-            print("[SMS SERVICE] âŒ SMS API error")
 
             return self._json_response(500, {
                 "success": False,
@@ -743,7 +722,6 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             })
 
         except Exception as e:
-            print("[SMS SERVICE] âŒ Unexpected error:", str(e))
             return self._json_response(500, {
                 "success": False,
                 "message": str(e)
