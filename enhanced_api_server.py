@@ -58,11 +58,6 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # odoo 3rd party api for sms 
-def _json_response(self, status=200, payload=None):
-    self.send_response(status)
-    self.send_header("Content-Type", "application/json")
-    self.end_headers()
-    self.wfile.write(json.dumps(payload or {}).encode("utf-8"))
 
 
 # --- Performance Helper Functions ---
@@ -650,6 +645,11 @@ def strip_html_tags(text):
     return clean.strip()
 
 class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
+    def _json_response(self, status=200, payload=None):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload or {}).encode("utf-8"))
     def handle_send_invoice_sms(self, data):
         print("[SMS SERVICE] ===============================")
         print("[SMS SERVICE] Request received")
