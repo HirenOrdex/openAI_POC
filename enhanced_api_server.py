@@ -645,11 +645,6 @@ def strip_html_tags(text):
     return clean.strip()
 
 class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
-    def _json_response(self, status=200, payload=None):
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(payload or {}).encode("utf-8"))
     def handle_send_invoice_sms(self, data):
         print("[SMS SERVICE] ===============================")
         print("[SMS SERVICE] Request received")
@@ -666,7 +661,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             print(f"[SMS SERVICE] Invoice URL: {invoice_url}")
 
             if not phone_number:
-                return self._json_response(400, {
+                return self._send_response(400, {
                     "success": False,
                     "message": "Phone number missing"
                 })
@@ -708,21 +703,21 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             )
 
             if response.status_code in (200, 201):
-                return self._json_response(200, {
+                return self._send_response(200, {
                     "success": True,
                     "message": "SMS sent successfully",
                     "response": response.text,
                     "invoice_url": invoice_url
                 })
 
-            return self._json_response(500, {
+            return self._send_response(500, {
                 "success": False,
                 "message": "019SMS API error",
                 "response": response.text
             })
 
         except Exception as e:
-            return self._json_response(500, {
+            return self._send_response(500, {
                 "success": False,
                 "message": str(e)
             })
