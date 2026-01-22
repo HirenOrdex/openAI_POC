@@ -25,7 +25,6 @@ ODOO_DB = config.get('odoo', 'db')
 ODOO_USER = config.get('odoo', 'user')
 ODOO_PASSWORD = config.get('odoo', 'password')
 JWT_SECRET = config.get('api', 'jwt_secret')
-SMS_API_KEY = config.get('sms', 'sms_bearer_token')
 
 # --- Performance Optimizations ---
 # Connection pooling
@@ -56,112 +55,6 @@ handler = RotatingFileHandler(log_file, maxBytes=max_size_mb * 1024 * 1024, back
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
-
-# odoo 3rd party api for sms 
-def _json_response(self, status=200, payload=None):
-    self.send_response(status)
-    self.send_header("Content-Type", "application/json")
-    self.end_headers()
-    self.wfile.write(json.dumps(payload or {}).encode("utf-8"))
-
-def handle_send_invoice_sms(self):
-    print("[SMS SERVICE] ===============================")
-    print("[SMS SERVICE] Request received")
-
-    try:
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        data = json.loads(body.decode("utf-8"))
-
-        order_name = data.get("order_name")
-        customer_name = data.get("customer_name", "Anonymous")
-        phone_number = data.get("phone_number")
-        invoice_url = data.get("invoice_url")
-
-        print(f"[SMS SERVICE] Order: {order_name}")
-        print(f"[SMS SERVICE] Customer: {customer_name}")
-        print(f"[SMS SERVICE] Phone (raw): {phone_number}")
-        print(f"[SMS SERVICE] Invoice URL: {invoice_url}")
-
-        if not phone_number:
-            return self._json_response(400, {
-                "success": False,
-                "message": "Phone number missing"
-            })
-
-        # ✅ Format phone (same logic)
-        formatted_phone = (
-            phone_number
-            if phone_number.startswith("+")
-            else f"+972{phone_number[1:]}"
-        )
-
-        print(f"[SMS SERVICE] Formatted phone: {formatted_phone}")
-
-        # ✅ Build message (same content)
-        message = (
-            f"✅ SUCCESS! Your order has been completed!\n"
-            f"Order: {order_name}\n"
-            f"Customer: {customer_name}"
-        )
-
-        if invoice_url:
-            message += f"\n\n📄 View your invoice (PDF):\n{invoice_url}"
-            print("[SMS SERVICE] Invoice URL included")
-        else:
-            print("[SMS SERVICE] No invoice URL provided")
-
-        payload = {
-            "sms": {
-                "user": {"username": "eyezon"},
-                "source": "Grocery",
-                "destinations": {"phone": formatted_phone},
-                "message": message
-            }
-        }
-
-        print("[SMS SERVICE] Sending SMS to 019sms...")
-        print("[SMS SERVICE] Payload:", json.dumps(payload, ensure_ascii=False))
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {SMS_API_KEY}"
-        }
-
-        response = requests.post(
-            "https://019sms.co.il/api",
-            json=payload,
-            headers=headers,
-            timeout=10
-        )
-
-        print("[SMS SERVICE] API Status:", response.status_code)
-        print("[SMS SERVICE] API Response:", response.text)
-
-        if response.status_code in (200, 201):
-            print("[SMS SERVICE] ✅ SMS sent successfully")
-
-            return self._json_response(200, {
-                "success": True,
-                "message": "SMS sent successfully",
-                "response": response.text,
-                "invoice_url": invoice_url
-            })
-
-        print("[SMS SERVICE] ❌ SMS API error")
-
-        return self._json_response(500, {
-            "success": False,
-            "message": "019SMS API error",
-            "response": response.text
-        })
-
-    except Exception as e:
-        print("[SMS SERVICE] ❌ Unexpected error:", str(e))
-        return self._json_response(500, {
-            "success": False,
-            "message": str(e)
-        })
 
 # --- Performance Helper Functions ---
 def get_cached_data(key):
@@ -882,8 +775,6 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 # Handle /api/v1/user/{user_id} for updating user by ID
                 user_id = self.path.split('/')[-1]
                 self.handle_update_user_by_id(data, user_id)
-            elif self.path == "/api/v1/send-sms":
-                self.handle_send_invoice_sms(data)
             else:
                 self._send_response({'error': 'Not Found'}, 404)
         except Exception as e:
