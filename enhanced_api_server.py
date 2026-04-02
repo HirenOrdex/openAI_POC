@@ -225,7 +225,7 @@ def _cleanup_expired_otps():
             'res.partner', 'search',
             [[
                 ('x_otp_expires_at', '!=', False),
-                ('x_otp_expires_at', '<', current_time.isoformat())
+                ('x_otp_expires_at', '<', current_time.strftime("%Y-%m-%d %H:%M:%S"))
             ]]
         )
         
@@ -254,8 +254,8 @@ def _store_otp_in_partner(user_id: int, otp: str) -> bool:
         # Update user record with OTP data using custom fields
         otp_data = {
             'x_otp_code': otp,
-            'x_otp_created_at': current_time.isoformat(),
-            'x_otp_expires_at': expires_at.isoformat(),
+            'x_otp_created_at': current_time.strftime("%Y-%m-%d %H:%M:%S"),
+            'x_otp_expires_at': expires_at.strftime("%Y-%m-%d %H:%M:%S"),
             'x_otp_attempts': 0  # Reset attempts when new OTP is generated
         }
         
@@ -284,7 +284,7 @@ def _validate_otp_from_partner(phone_or_email: str, otp: str) -> tuple:
             '|', ('phone', '=', phone_or_email), ('email', '=', phone_or_email),
             ('active', '=', True),
             ('x_otp_code', '!=', False),
-            ('x_otp_expires_at', '>', current_time.isoformat())
+            ('x_otp_expires_at', '>', current_time.strftime("%Y-%m-%d %H:%M:%S"))
         ]
         
         user_ids = execute_odoo_kw_optimized('res.partner', 'search', [domain])
@@ -356,12 +356,12 @@ def _get_otp_stats() -> dict:
         # Count active OTPs
         active_otps = len(execute_odoo_kw_optimized('res.partner', 'search', [[
             ('x_otp_code', '!=', False),
-            ('x_otp_expires_at', '>', current_time.isoformat())
+            ('x_otp_expires_at', '>', current_time.strftime("%Y-%m-%d %H:%M:%S"))
         ]]))
 
         expired_otps = len(execute_odoo_kw_optimized('res.partner', 'search', [[
             ('x_otp_code', '!=', False),
-            ('x_otp_expires_at', '<', current_time.isoformat())
+            ('x_otp_expires_at', '<', current_time.strftime("%Y-%m-%d %H:%M:%S"))
         ]]))
 
         
