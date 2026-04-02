@@ -180,7 +180,7 @@ def _cleanup_expired_otps():
         'res.partner', 'search',
         [[
             ('x_otp_expires_at', '!=', False),
-            ('x_otp_expires_at', '<', current_time.strftime("%Y-%m-%d %H:%M:%S"))
+            ('x_otp_expires_at', '<', current_time.isoformat())
         ]]
         )
         
@@ -239,7 +239,7 @@ def _validate_otp_from_partner(phone_or_email: str, otp: str) -> tuple[bool, int
             '|', ('phone', '=', phone_or_email), ('email', '=', phone_or_email),
             ('active', '=', True),
             ('x_otp_code', '!=', False),
-            ('x_otp_expires_at', '>', current_time.strftime("%Y-%m-%d %H:%M:%S"))
+            ('x_otp_expires_at', '>', current_time.isoformat())
         ]
         
         user_ids = execute_odoo_kw('res.partner', 'search', [domain])
@@ -311,12 +311,12 @@ def _get_otp_stats() -> dict:
         # Count active OTPs
         active_otps = len(execute_odoo_kw('res.partner', 'search', [[
             ('x_otp_code', '!=', False),
-            ('x_otp_expires_at', '>', current_time.strftime("%Y-%m-%d %H:%M:%S"))
+            ('x_otp_expires_at', '>', current_time.isoformat())
         ]]))
 
         expired_otps = len(execute_odoo_kw('res.partner', 'search', [[
             ('x_otp_code', '!=', False),
-            ('x_otp_expires_at', '<', current_time.strftime("%Y-%m-%d %H:%M:%S"))
+            ('x_otp_expires_at', '<', current_time.isoformat())
         ]]))
 
         
@@ -645,6 +645,87 @@ def strip_html_tags(text):
     return clean.strip()
 
 class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
+    def _json_response(self, status=200, payload=None):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(payload or {}).encode("utf-8"))
+    def handle_send_invoice_sms(self, data):
+        print("[SMS SERVICE] ===============================")
+        print("[SMS SERVICE] Request received")
+
+        try:
+            order_name = data.get("order_name")
+            customer_name = data.get("customer_name", "Anonymous")
+            phone_number = data.get("phone_number")
+            invoice_url = data.get("invoice_url")
+
+            print(f"[SMS SERVICE] Order: {order_name}")
+            print(f"[SMS SERVICE] Customer: {customer_name}")
+            print(f"[SMS SERVICE] Phone (raw): {phone_number}")
+            print(f"[SMS SERVICE] Invoice URL: {invoice_url}")
+
+            if not phone_number:
+                return self._json_response(400, {
+                    "success": False,
+                    "message": "Phone number missing"
+                })
+
+            formatted_phone = (
+                phone_number
+                if phone_number.startswith("+")
+                else f"+972{phone_number[1:]}"
+            )
+
+            message = (
+                f"✅ SUCCESS! Your order has been completed!\n"
+                f"Order: {order_name}\n"
+                f"Customer: {customer_name}"
+            )
+
+            if invoice_url:
+                message += f"\n\n📄 View your invoice (PDF):\n{invoice_url}"
+
+            payload = {
+                "sms": {
+                    "user": {"username": "eyezon"},
+                    "source": "Grocery",
+                    "destinations": {"phone": formatted_phone},
+                    "message": message
+                }
+            }
+
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {SMS_API_KEY}"
+            }
+
+            response = requests.post(
+                "https://019sms.co.il/api",
+                json=payload,
+                headers=headers,
+                timeout=10
+            )
+
+            if response.status_code in (200, 201):
+                return self._json_response(200, {
+                    "success": True,
+                    "message": "SMS sent successfully",
+                    "response": response.text,
+                    "invoice_url": invoice_url
+                })
+
+            return self._json_response(500, {
+                "success": False,
+                "message": "019SMS API error",
+                "response": response.text
+            })
+
+        except Exception as e:
+            return self._json_response(500, {
+                "success": False,
+                "message": str(e)
+            })
 
     def _send_response(self, data, status=200):
         self.send_response(status)
@@ -723,84 +804,6 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
         else:
             logger.warning(f"404 Not Found for path: {self.path}")
             self._send_response({'error': 'Not Found'}, 404)
-    def handle_send_invoice_sms(self, data):
-        print("[SMS SERVICE] ===============================")
-        print("[SMS SERVICE] Request received")
-
-        try:
-            order_name = data.get("order_name")
-            customer_name = data.get("customer_name", "Anonymous")
-            phone_number = data.get("phone_number")
-            invoice_url = data.get("invoice_url")
-
-            print(f"[SMS SERVICE] Order: {order_name}")
-            print(f"[SMS SERVICE] Customer: {customer_name}")
-            print(f"[SMS SERVICE] Phone (raw): {phone_number}")
-            print(f"[SMS SERVICE] Invoice URL: {invoice_url}")
-
-            if not phone_number:
-                self._send_response({
-                    "success": False,
-                    "message": "Phone number missing"
-                }, 400)
-                return
-
-            formatted_phone = (
-                phone_number
-                if phone_number.startswith("+")
-                else f"+972{phone_number[1:]}"
-            )
-
-            message = (
-                f"✅ SUCCESS! Your order has been completed!\n"
-                f"Order: {order_name}\n"
-                f"Customer: {customer_name}"
-            )
-
-            if invoice_url:
-                message += f"\n\n📄 View your invoice (PDF):\n{invoice_url}"
-
-            payload = {
-                "sms": {
-                    "user": {"username": "eyezon"},
-                    "source": "Grocery",
-                    "destinations": {"phone": formatted_phone},
-                    "message": message
-                }
-            }
-
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {SMS_API_KEY}"
-            }
-
-            response = requests.post(
-                "https://019sms.co.il/api",
-                json=payload,
-                headers=headers,
-                timeout=10
-            )
-
-            if response.status_code in (200, 201):
-                self._send_response({
-                    "success": True,
-                    "message": "SMS sent successfully",
-                    "response": response.text,
-                    "invoice_url": invoice_url
-                }, 200)
-                return
-
-            self._send_response({
-                "success": False,
-                "message": "019SMS API error",
-                "response": response.text
-            }, 500)
-
-        except Exception as e:
-            self._send_response({
-                "success": False,
-                "message": str(e)
-            }, 500)
 
     def handle_get_user_list(self):
         """GET /api/v1/user/list?active=true|false - Get user list filtered by active status."""
