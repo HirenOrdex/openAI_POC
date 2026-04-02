@@ -28,16 +28,14 @@ JWT_SECRET = config.get('api', 'jwt_secret')
 SMS_API_KEY = config.get('sms', 'sms_bearer_token')
 
 # --- Performance Optimizations ---
-# Connection pooling with cleanup
+# Connection pooling
 odoo_connections = {}
 connection_lock = threading.RLock()
 last_cleanup = time.time()
-last_connection_cleanup = time.time()
 
 # Simple in-memory cache with TTL
 cache_data = {}
 cache_timestamps = {}
-cache_lock = threading.RLock()  # FIX: Add lock for cache operations
 CACHE_TTL = 300  # 5 minutes
 
 # Reduce logging for performance (keep original level but optimize calls)
@@ -59,74 +57,43 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-# Add console handler for critical errors to see them even if file logging fails
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.ERROR)
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
-
 # odoo 3rd party api for sms 
 
 
 # --- Performance Helper Functions ---
 def get_cached_data(key):
-    """Get cached data if still valid - THREAD SAFE"""
+    """Get cached data if still valid"""
     current_time = time.time()
-    with cache_lock:
-        if key in cache_data and key in cache_timestamps:
-            if current_time - cache_timestamps[key] < CACHE_TTL:
-                return cache_data[key]
-            else:
-                # Remove expired cache
-                cache_data.pop(key, None)
-                cache_timestamps.pop(key, None)
+    if key in cache_data and key in cache_timestamps:
+        if current_time - cache_timestamps[key] < CACHE_TTL:
+            return cache_data[key]
+        else:
+            # Remove expired cache
+            cache_data.pop(key, None)
+            cache_timestamps.pop(key, None)
     return None
 
 def set_cached_data(key, data):
-    """Set cached data with timestamp - THREAD SAFE"""
-    with cache_lock:
-        cache_data[key] = data
-        cache_timestamps[key] = time.time()
+    """Set cached data with timestamp"""
+    cache_data[key] = data
+    cache_timestamps[key] = time.time()
 
 def cleanup_cache():
-    """Clean expired cache entries - THREAD SAFE"""
+    """Clean expired cache entries"""
     global last_cleanup
     current_time = time.time()
     if current_time - last_cleanup > 60:  # Cleanup every minute
-        with cache_lock:
-            expired_keys = []
-            for key, timestamp in list(cache_timestamps.items()):  # FIX: Use list() to avoid dict changed during iteration
-                if current_time - timestamp > CACHE_TTL:
-                    expired_keys.append(key)
-            for key in expired_keys:
-                cache_data.pop(key, None)
-                cache_timestamps.pop(key, None)
-            last_cleanup = current_time
-
-def cleanup_old_connections():
-    """Clean up stale connections - THREAD SAFE"""
-    global last_connection_cleanup
-    current_time = time.time()
-    
-    # Only cleanup every 5 minutes to reduce overhead
-    if current_time - last_connection_cleanup < 300:
-        return
-    
-    with connection_lock:
-        stale_threads = []
-        for thread_id, conn_info in list(odoo_connections.items()):  # FIX: Use list()
-            # Remove connections older than 10 minutes
-            if current_time - conn_info['created_at'] > 600:
-                stale_threads.append(thread_id)
-        
-        for thread_id in stale_threads:
-            odoo_connections.pop(thread_id, None)
-            logger.info(f"Cleaned up stale connection for thread {thread_id}")
-        
-        last_connection_cleanup = current_time
+        expired_keys = []
+        for key, timestamp in cache_timestamps.items():
+            if current_time - timestamp > CACHE_TTL:
+                expired_keys.append(key)
+        for key in expired_keys:
+            cache_data.pop(key, None)
+            cache_timestamps.pop(key, None)
+        last_cleanup = current_time
 
 def get_or_create_odoo_connection():
-    """Get pooled Odoo connection or create new one - THREAD SAFE"""
+    """Get pooled Odoo connection or create new one"""
     thread_id = threading.current_thread().ident
     current_time = time.time()
     
@@ -137,9 +104,6 @@ def get_or_create_odoo_connection():
             # Reuse connection if it's less than 10 minutes old
             if current_time - conn_info['created_at'] < 600:
                 return conn_info['uid'], conn_info['models']
-            else:
-                # Remove stale connection
-                odoo_connections.pop(thread_id, None)
         
         # Create new connection
         try:
@@ -161,12 +125,8 @@ def get_or_create_odoo_connection():
             logger.error(f"Failed to connect to Odoo: {str(e)}")
             raise
 
-# FIX: Change default arguments from mutable [] and {} to None
-def execute_odoo_kw_optimized(model, method, args=None, kwargs=None, cache_key=None):
+def execute_odoo_kw_optimized(model, method, args=[], kwargs={}, cache_key=None):
     """Execute Odoo method with caching and connection pooling"""
-    args = args or []  # FIX: Avoid mutable default argument
-    kwargs = kwargs or {}  # FIX: Avoid mutable default argument
-    
     # Check cache first for read operations
     if cache_key and method in ['search', 'read', 'search_read']:
         cached_result = get_cached_data(cache_key)
@@ -181,9 +141,6 @@ def execute_odoo_kw_optimized(model, method, args=None, kwargs=None, cache_key=N
         if cache_key and method in ['search', 'read', 'search_read']:
             set_cached_data(cache_key, result)
         
-        # Periodic connection cleanup
-        cleanup_old_connections()
-        
         return result
     except Exception as e:
         # Remove failed connection from pool
@@ -195,9 +152,7 @@ def execute_odoo_kw_optimized(model, method, args=None, kwargs=None, cache_key=N
 
 # --- Session Management ---
 active_sessions = {}
-active_sessions_lock = threading.RLock()  # FIX: Add lock for sessions
 blacklisted_tokens = set()
-blacklisted_tokens_lock = threading.RLock()  # FIX: Add lock for blacklist
 
 # --- Database-Level OTP Management using res.partner ---
 OTP_TTL_SECONDS = 300  # 5 minutes
@@ -220,18 +175,18 @@ def _cleanup_expired_otps():
     try:
         current_time = datetime.utcnow()
         
-        # FIX: Use optimized function to prevent connection exhaustion
-        users_with_expired_otps = execute_odoo_kw_optimized(
-            'res.partner', 'search',
-            [[
-                ('x_otp_expires_at', '!=', False),
-                ('x_otp_expires_at', '<', current_time.strftime("%Y-%m-%d %H:%M:%S"))
-            ]]
+        # Find users with expired OTPs
+        users_with_expired_otps = execute_odoo_kw (
+        'res.partner', 'search',
+        [[
+            ('x_otp_expires_at', '!=', False),
+            ('x_otp_expires_at', '<', current_time.strftime("%Y-%m-%d %H:%M:%S"))
+        ]]
         )
         
         if users_with_expired_otps:
             # Clear expired OTP data
-            execute_odoo_kw_optimized('res.partner', 'write', [
+            execute_odoo_kw('res.partner', 'write', [
                 users_with_expired_otps,
                 {
                     'x_otp_code': False,
@@ -243,7 +198,7 @@ def _cleanup_expired_otps():
             logger.info(f"Cleaned up expired OTPs for {len(users_with_expired_otps)} users")
             
     except Exception as e:
-        logger.error(f"Failed to cleanup expired OTPs: {str(e)}", exc_info=True)  # FIX: Add exc_info
+        logger.error(f"Failed to cleanup expired OTPs: {str(e)}")
 
 def _store_otp_in_partner(user_id: int, otp: str) -> bool:
     """Store OTP data directly in res.partner record"""
@@ -254,12 +209,12 @@ def _store_otp_in_partner(user_id: int, otp: str) -> bool:
         # Update user record with OTP data using custom fields
         otp_data = {
             'x_otp_code': otp,
-            'x_otp_created_at': current_time.strftime("%Y-%m-%d %H:%M:%S"),
-            'x_otp_expires_at': expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+            'x_otp_created_at': current_time.isoformat(),
+            'x_otp_expires_at': expires_at.isoformat(),
             'x_otp_attempts': 0  # Reset attempts when new OTP is generated
         }
         
-        execute_odoo_kw_optimized('res.partner', 'write', [[user_id], otp_data])
+        execute_odoo_kw('res.partner', 'write', [[user_id], otp_data])
         logger.info(f"OTP stored in user record {user_id}, expires at {expires_at}")
         
         # Clean up expired OTPs from other users periodically
@@ -268,10 +223,10 @@ def _store_otp_in_partner(user_id: int, otp: str) -> bool:
         return True
         
     except Exception as e:
-        logger.error(f"Failed to store OTP in user record {user_id}: {str(e)}", exc_info=True)
+        logger.error(f"Failed to store OTP in user record {user_id}: {str(e)}")
         return False
 
-def _validate_otp_from_partner(phone_or_email: str, otp: str) -> tuple:
+def _validate_otp_from_partner(phone_or_email: str, otp: str) -> tuple[bool, int, str]:
     """Validate OTP from res.partner record with attempt tracking"""
     try:
         # Clean expired OTPs first
@@ -287,7 +242,7 @@ def _validate_otp_from_partner(phone_or_email: str, otp: str) -> tuple:
             ('x_otp_expires_at', '>', current_time.strftime("%Y-%m-%d %H:%M:%S"))
         ]
         
-        user_ids = execute_odoo_kw_optimized('res.partner', 'search', [domain])
+        user_ids = execute_odoo_kw('res.partner', 'search', [domain])
         
         if not user_ids:
             return False, None, 'OTP not found or expired. Please request a new code.'
@@ -295,7 +250,7 @@ def _validate_otp_from_partner(phone_or_email: str, otp: str) -> tuple:
         user_id = user_ids[0]
         
         # Get current OTP data
-        user_data = execute_odoo_kw_optimized('res.partner', 'read', [
+        user_data = execute_odoo_kw('res.partner', 'read', [
             user_id, 
             ['x_otp_code', 'x_otp_attempts', 'x_otp_expires_at']
         ])[0]
@@ -305,7 +260,7 @@ def _validate_otp_from_partner(phone_or_email: str, otp: str) -> tuple:
         # Check if max attempts exceeded
         if current_attempts >= MAX_OTP_ATTEMPTS:
             # Clear OTP data to prevent further attempts
-            execute_odoo_kw_optimized('res.partner', 'write', [[user_id], {
+            execute_odoo_kw('res.partner', 'write', [[user_id], {
                 'x_otp_code': False,
                 'x_otp_expires_at': False,
                 'x_otp_attempts': 0,
@@ -315,14 +270,14 @@ def _validate_otp_from_partner(phone_or_email: str, otp: str) -> tuple:
         
         # Increment attempt counter
         new_attempts = current_attempts + 1
-        execute_odoo_kw_optimized('res.partner', 'write', [[user_id], {'x_otp_attempts': new_attempts}])
+        execute_odoo_kw('res.partner', 'write', [[user_id], {'x_otp_attempts': new_attempts}])
         
         # Validate OTP code
         stored_otp = user_data.get('x_otp_code', '')
         if str(stored_otp) != str(otp):
             if new_attempts >= MAX_OTP_ATTEMPTS:
                 # Clear OTP data if max attempts reached
-                execute_odoo_kw_optimized('res.partner', 'write', [[user_id], {
+                execute_odoo_kw('res.partner', 'write', [[user_id], {
                     'x_otp_code': False,
                     'x_otp_expires_at': False,
                     'x_otp_attempts': 0,
@@ -334,7 +289,7 @@ def _validate_otp_from_partner(phone_or_email: str, otp: str) -> tuple:
                 return False, None, f'Invalid OTP. {remaining_attempts} attempt(s) remaining.'
         
         # OTP is valid - clear OTP data (single-use)
-        execute_odoo_kw_optimized('res.partner', 'write', [[user_id], {
+        execute_odoo_kw('res.partner', 'write', [[user_id], {
             'x_otp_code': False,
             'x_otp_expires_at': False,
             'x_otp_attempts': 0,
@@ -345,7 +300,7 @@ def _validate_otp_from_partner(phone_or_email: str, otp: str) -> tuple:
         return True, user_id, None
         
     except Exception as e:
-        logger.error(f"Failed to validate OTP: {str(e)}", exc_info=True)
+        logger.error(f"Failed to validate OTP: {str(e)}")
         return False, None, f'OTP validation failed: {str(e)}'
 
 def _get_otp_stats() -> dict:
@@ -354,12 +309,12 @@ def _get_otp_stats() -> dict:
         current_time = datetime.utcnow()
         
         # Count active OTPs
-        active_otps = len(execute_odoo_kw_optimized('res.partner', 'search', [[
+        active_otps = len(execute_odoo_kw('res.partner', 'search', [[
             ('x_otp_code', '!=', False),
             ('x_otp_expires_at', '>', current_time.strftime("%Y-%m-%d %H:%M:%S"))
         ]]))
 
-        expired_otps = len(execute_odoo_kw_optimized('res.partner', 'search', [[
+        expired_otps = len(execute_odoo_kw('res.partner', 'search', [[
             ('x_otp_code', '!=', False),
             ('x_otp_expires_at', '<', current_time.strftime("%Y-%m-%d %H:%M:%S"))
         ]]))
@@ -373,16 +328,16 @@ def _get_otp_stats() -> dict:
         }
         
     except Exception as e:
-        logger.error(f"Failed to get OTP stats: {str(e)}", exc_info=True)
+        logger.error(f"Failed to get OTP stats: {str(e)}")
         return {'error': str(e)}
 
 def _check_otp_fields_exist() -> bool:
     """Check if custom OTP fields exist in res.partner model"""
     try:
         # Try to read OTP fields from any partner record to test if fields exist
-        partner_ids = execute_odoo_kw_optimized('res.partner', 'search', [[]], {'limit': 1})
+        partner_ids = execute_odoo_kw('res.partner', 'search', [[]], {'limit': 1})
         if partner_ids:
-            execute_odoo_kw_optimized('res.partner', 'read', [
+            execute_odoo_kw('res.partner', 'read', [
                 partner_ids[0], 
                 ['x_otp_code', 'x_otp_created_at', 'x_otp_expires_at', 'x_otp_attempts']
             ])
@@ -444,7 +399,7 @@ def _get_and_validate_otp(identifier: str, otp: str):
                 return False, user_id, error
                 
         except Exception as e:
-            logger.error(f"Partner OTP validation exception: {str(e)}, trying local storage", exc_info=True)
+            logger.error(f"Partner OTP validation exception: {str(e)}, trying local storage")
     
     # Fallback to local storage for development/testing
     logger.warning("Using local OTP validation - checking local storage")
@@ -471,7 +426,7 @@ def _get_and_validate_otp(identifier: str, otp: str):
             return False, None, 'Invalid OTP'
         # OTP valid, remove it (single-use)
         otp_store.pop(identifier, None)
-        logger.info(f"✅ OTP validated successfully from local storage for user_id={entry['user_id']}")
+        logger.info(f"âœ… OTP validated successfully from local storage for user_id={entry['user_id']}")
         return True, entry['user_id'], None
 
 def _get_sms_config():
@@ -486,10 +441,10 @@ def _get_sms_config():
             'valid_time': config.getint('sms', 'valid_time', fallback=5)
         }
     except Exception as e:
-        logger.error(f"Failed to load SMS config: {e}", exc_info=True)
+        logger.error(f"Failed to load SMS config: {e}")
         return None
 
-def _format_phone_for_019sms(phone: str) -> tuple:
+def _format_phone_for_019sms(phone: str) -> tuple[str, bool]:
     """Format phone number for 019sms API (format: +972545590094)
     Returns (formatted_phone, is_israeli_number)
     """
@@ -521,96 +476,95 @@ def _format_phone_for_019sms(phone: str) -> tuple:
     
     return None, False
 
-def _send_otp_via_019sms(to_phone: str, otp_code: str) -> tuple:
+def _send_otp_via_019sms(to_phone: str, otp_code: str) -> tuple[bool, str]:
     """Send OTP using 019SMS API with Bearer token authentication and proper message format.
     Returns (success, error_message).
     """
-    try:  # FIX: Wrap entire function in try-except
-        sms_config = _get_sms_config()
-        if not sms_config:
-            return False, "SMS configuration not available"
-        
-        # Format phone number for 019sms
-        formatted_phone, is_israeli = _format_phone_for_019sms(to_phone)
-        if not formatted_phone:
-            return False, "Invalid phone number format"
-        
-        # For non-Israeli numbers, return mock success for testing
-        if not is_israeli:
-            logger.info(f"Mock OTP sent to international number: {to_phone} with code: {otp_code}")
-            return True, "Mock SMS sent for international number"
-        
-        # Prepare the payload according to 019SMS standard format
-        # Professional OTP message format
-        message = f"Your verification code is: {otp_code}\nValid for {sms_config['valid_time']} minutes.\nDo not share this code."
-        
-        payload = {
-            "sms": {
-                "user": {
-                    "username": sms_config['username']
-                },
-                "source": sms_config['source'],
-                "destinations": {
-                    "phone": formatted_phone
-                },
-                "message": message
-            }
+    sms_config = _get_sms_config()
+    if not sms_config:
+        return False, "SMS configuration not available"
+    
+    # Format phone number for 019sms
+    formatted_phone, is_israeli = _format_phone_for_019sms(to_phone)
+    if not formatted_phone:
+        return False, "Invalid phone number format"
+    
+    # For non-Israeli numbers, return mock success for testing
+    if not is_israeli:
+        logger.info(f"Mock OTP sent to international number: {to_phone} with code: {otp_code}")
+        return True, "Mock SMS sent for international number"
+    
+    # Prepare the payload according to 019SMS standard format
+    # Professional OTP message format
+    message = f"Your verification code is: {otp_code}\nValid for {sms_config['valid_time']} minutes.\nDo not share this code."
+    
+    payload = {
+        "sms": {
+            "user": {
+                "username": sms_config['username']
+            },
+            "source": sms_config['source'],
+            "destinations": {
+                "phone": formatted_phone
+            },
+            "message": message
         }
+    }
+    
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f"Bearer {sms_config['bearer_token']}"
+    }
+    
+    try:
+        logger.info(f"Sending OTP to phone: {formatted_phone} (original: {to_phone})")
+        resp = requests.post(sms_config['api_url'], json=payload, headers=headers, timeout=15)
         
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f"Bearer {sms_config['bearer_token']}"
-        }
+        if resp.status_code != 200:
+            logger.error(f"019SMS API HTTP error: {resp.status_code} - {resp.text}")
+            return False, f"SMS service error: HTTP {resp.status_code}"
         
         try:
-            logger.info(f"Sending OTP to phone: {formatted_phone} (original: {to_phone})")
-            resp = requests.post(sms_config['api_url'], json=payload, headers=headers, timeout=15)
+            response_data = resp.json()
+            logger.info(f"019SMS API response: {response_data}")
             
-            if resp.status_code not in (200, 201):
-                logger.error(f"019SMS API HTTP error: {resp.status_code} - {resp.text}")
-                return False, f"SMS service error: HTTP {resp.status_code}"
+            # Check for success - 019SMS returns numeric status codes
+            # Status 200 or string 'success' = success
+            # Any other status code or error message = failure
+            status = response_data.get('status')
+            message = response_data.get('message', '')
             
-            try:
-                response_data = resp.json()
-                logger.info(f"019SMS API response: {response_data}")
+            # Check if it's a success response
+            # 019SMS returns status 0 or 200 for success
+            if status == 0 or status == 200 or status == 'success' or response_data.get('success') == True:
+                logger.info(f"✅ OTP sent successfully to {formatted_phone} (shipment_id: {response_data.get('shipment_id', 'N/A')})")
+                return True, ''
+            
+            # Check for error status codes (but not 0 which is success)
+            if isinstance(status, int) and status != 0 and status != 200:
+                error_msg = f"{message} (status: {status})" if message else f"SMS service error (status: {status})"
+                logger.error(f"❌ 019SMS API error: {error_msg}")
+                return False, error_msg
+            
+            # Check for error in message or explicit error field
+            if 'error' in str(response_data).lower() or response_data.get('error'):
+                error_msg = response_data.get('message') or response_data.get('error') or 'Unknown SMS service error'
+                logger.error(f"❌ 019SMS API error: {error_msg}")
+                return False, f"SMS service error: {error_msg}"
+            
+            # If we get here, uncertain status - treat as error for safety
+            logger.warning(f"⚠️  019SMS API returned unclear status: {response_data}")
+            return False, f"SMS service returned unclear response: {message}"
                 
-                # Check for success - 019SMS returns numeric status codes
-                status = response_data.get('status')
-                message = response_data.get('message', '')
-                
-                # Check if it's a success response
-                if status == 0 or status == 200 or status == 'success' or response_data.get('success') == True:
-                    logger.info(f"✅ OTP sent successfully to {formatted_phone} (shipment_id: {response_data.get('shipment_id', 'N/A')})")
-                    return True, ''
-                
-                # Check for error status codes
-                if isinstance(status, int) and status != 0 and status != 200:
-                    error_msg = f"{message} (status: {status})" if message else f"SMS service error (status: {status})"
-                    logger.error(f"❌ 019SMS API error: {error_msg}")
-                    return False, error_msg
-                
-                # Check for error in message or explicit error field
-                if 'error' in str(response_data).lower() or response_data.get('error'):
-                    error_msg = response_data.get('message') or response_data.get('error') or 'Unknown SMS service error'
-                    logger.error(f"❌ 019SMS API error: {error_msg}")
-                    return False, f"SMS service error: {error_msg}"
-                
-                # If we get here, uncertain status - treat as error for safety
-                logger.warning(f"⚠️  019SMS API returned unclear status: {response_data}")
-                return False, f"SMS service returned unclear response: {message}"
-                    
-            except json.JSONDecodeError as je:
-                logger.error(f"019SMS API invalid JSON response: {resp.text}", exc_info=True)
-                return False, "SMS service returned invalid response"
-                
-        except requests.exceptions.Timeout as te:
-            logger.error(f"019SMS API timeout: {str(te)}", exc_info=True)
-            return False, "SMS service timeout"
-        except requests.exceptions.RequestException as re:
-            logger.error(f"019SMS API request failed: {str(re)}", exc_info=True)
-            return False, f"SMS service request failed: {str(re)}"
+        except json.JSONDecodeError:
+            logger.error(f"019SMS API invalid JSON response: {resp.text}")
+            return False, "SMS service returned invalid response"
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"019SMS API request failed: {str(e)}")
+        return False, f"SMS service request failed: {str(e)}"
     except Exception as e:
-        logger.error(f"019SMS API unexpected error: {str(e)}", exc_info=True)
+        logger.error(f"019SMS API unexpected error: {str(e)}")
         return False, f"SMS service error: {str(e)}"
 
 def generate_session_id(user_id):
@@ -619,7 +573,6 @@ def generate_session_id(user_id):
     return hashlib.sha256(data.encode()).hexdigest()
 
 def create_session(user_id, user_data, token):
-    """Create session - THREAD SAFE"""
     session_id = generate_session_id(user_id)
     session_data = {
         'user_id': user_id,
@@ -628,24 +581,20 @@ def create_session(user_id, user_data, token):
         'created_at': datetime.utcnow(),
         'last_activity': datetime.utcnow()
     }
-    with active_sessions_lock:
-        active_sessions[session_id] = session_data
+    active_sessions[session_id] = session_data
     logger.info(f"Session created with ID: {session_id} for user: {user_id}")
     return session_id
 
 def validate_token_and_session(token):
-    """Validate token - THREAD SAFE"""
-    with blacklisted_tokens_lock:
-        if token in blacklisted_tokens:
-            raise jwt.InvalidTokenError("Token has been revoked")
+    if token in blacklisted_tokens:
+        raise jwt.InvalidTokenError("Token has been revoked")
     
     try:
         decoded_token = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
-        with active_sessions_lock:
-            for session_id, session_data in active_sessions.items():
-                if session_data['token'] == token:
-                    session_data['last_activity'] = datetime.utcnow()
-                    break
+        for session_id, session_data in active_sessions.items():
+            if session_data['token'] == token:
+                session_data['last_activity'] = datetime.utcnow()
+                break
         return decoded_token
     except jwt.ExpiredSignatureError:
         raise jwt.ExpiredSignatureError("Token has expired")
@@ -653,36 +602,38 @@ def validate_token_and_session(token):
         raise jwt.InvalidTokenError("Invalid token")
 
 def invalidate_session(token):
-    """Invalidate session - THREAD SAFE"""
-    with blacklisted_tokens_lock:
-        blacklisted_tokens.add(token)
-    
-    with active_sessions_lock:
-        for session_id, session_data in list(active_sessions.items()):
-            if session_data['token'] == token:
-                del active_sessions[session_id]
-                logger.info(f"Session {session_id} invalidated")
-                break
+    blacklisted_tokens.add(token)
+    for session_id, session_data in list(active_sessions.items()):
+        if session_data['token'] == token:
+            del active_sessions[session_id]
+            logger.info(f"Session {session_id} invalidated")
+            break
 
 def cleanup_expired_sessions():
-    """Cleanup expired sessions - THREAD SAFE"""
     current_time = datetime.utcnow()
     expired_sessions = []
     
-    with active_sessions_lock:
-        for session_id, session_data in list(active_sessions.items()):  # FIX: Use list()
-            if (current_time - session_data['last_activity']).total_seconds() > 10800:
-                expired_sessions.append((session_id, session_data['token']))
-        
-        for session_id, token in expired_sessions:
-            del active_sessions[session_id]
-            with blacklisted_tokens_lock:
-                blacklisted_tokens.add(token)
-            logger.info(f"Expired session {session_id} cleaned up")
+    for session_id, session_data in active_sessions.items():
+        if (current_time - session_data['last_activity']).total_seconds() > 10800:
+            expired_sessions.append(session_id)
+            blacklisted_tokens.add(session_data['token'])
+    
+    for session_id in expired_sessions:
+        del active_sessions[session_id]
+        logger.info(f"Expired session {session_id} cleaned up")
 
 # --- XML-RPC Connection ---
-# FIX: Remove the old execute_odoo_kw function to prevent confusion
-# Only use execute_odoo_kw_optimized everywhere
+def get_odoo_uid():
+    common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common')
+    uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_PASSWORD, {})
+    if not uid:
+        raise ConnectionRefusedError("Failed to authenticate with Odoo")
+    return uid
+
+def execute_odoo_kw(model, method, args=[], kwargs={}):
+    uid = get_odoo_uid()
+    models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object')
+    return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, model, method, args, kwargs)
 
 # --- Utility Functions ---
 def strip_html_tags(text):
@@ -696,106 +647,87 @@ def strip_html_tags(text):
 class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
 
     def _send_response(self, data, status=200):
-        try:  # FIX: Wrap response in try-except
-            self.send_response(status)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-            self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-            self.end_headers()
-            self.wfile.write(json.dumps(data, indent=2).encode('utf-8'))
-        except Exception as e:
-            logger.error(f"Failed to send response: {str(e)}", exc_info=True)
+        self.send_response(status)
+        self.send_header('Content-type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, indent=2).encode('utf-8'))
 
     def do_OPTIONS(self):
-        try:  # FIX: Wrap in try-except
-            self.send_response(200)
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
-            self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
-            self.end_headers()
-        except Exception as e:
-            logger.error(f"OPTIONS request failed: {str(e)}", exc_info=True)
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.end_headers()
         
     def do_GET(self):
-        try:  # FIX: Wrap entire method in try-except
-            cleanup_cache()  # Periodic cache cleanup
-            if self.path == '/api/v1/health':
-                otp_stats = _get_otp_stats()
-                otp_fields_exist = _check_otp_fields_exist()
-                
-                with connection_lock:
-                    conn_count = len(odoo_connections)
-                with active_sessions_lock:
-                    session_count = len(active_sessions)
-                with cache_lock:
-                    cache_count = len(cache_data)
-                
-                self._send_response({
-                    'status': 'ok', 
-                    'message': 'OPTIMIZED Enhanced Store API with Database OTP is running!',
-                    'database': ODOO_DB,
-                    'port': config.getint('server', 'port', fallback=8001),
-                    'performance_info': {
-                        'cache_entries': cache_count,
-                        'active_connections': conn_count,
-                        'active_sessions': session_count
-                    },
-                    'otp_info': {
-                        'storage_type': 'res.partner (database)' if otp_fields_exist else 'local memory (fallback)',
-                        'fields_configured': otp_fields_exist,
-                        'statistics': otp_stats
-                    },
-                    'optimizations': [
-                        'Connection pooling enabled',
-                        'Response caching (5 min TTL)',
-                        'Optimized session management',
-                        'Database-level OTP storage',
-                        '019SMS integration with dynamic codes',
-                        'Compact JSON responses',
-                        'Thread-safe operations',
-                        'Fixed mutable defaults bug'
+        cleanup_cache()  # Periodic cache cleanup
+        if self.path == '/api/v1/health':
+            otp_stats = _get_otp_stats()
+            otp_fields_exist = _check_otp_fields_exist()
+            
+            self._send_response({
+                'status': 'ok', 
+                'message': 'OPTIMIZED Enhanced Store API with Database OTP is running!',
+                'database': ODOO_DB,
+                'port': config.getint('server', 'port', fallback=8001),
+                'performance_info': {
+                    'cache_entries': len(cache_data),
+                    'active_connections': len(odoo_connections),
+                    'active_sessions': len(active_sessions)
+                },
+                'otp_info': {
+                    'storage_type': 'res.partner (database)' if otp_fields_exist else 'local memory (fallback)',
+                    'fields_configured': otp_fields_exist,
+                    'statistics': otp_stats
+                },
+                'optimizations': [
+                    'Connection pooling enabled',
+                    'Response caching (5 min TTL)',
+                    'Optimized session management',
+                    'Database-level OTP storage',
+                    '019SMS integration with dynamic codes',
+                    'Compact JSON responses'
+                ],
+                'new_endpoints': [
+                    'GET /api/v1/user/details - Get user details',
+                    'POST /api/v1/user/update - Update user details', 
+                    'PUT /api/v1/user/{user_id} - Update user by ID',
+                    'POST /api/v1/user/logout - Logout user',
+                    'GET /api/v1/user/sessions - Get active sessions',
+                    'DELETE /api/v1/user/{user_id} - Soft delete user'
+                ],
+                'database_requirements': {
+                    'required_custom_fields': [
+                        'x_otp_code (Char) - Stores the OTP code',
+                        'x_otp_created_at (Datetime) - OTP creation timestamp',
+                        'x_otp_expires_at (Datetime) - OTP expiration timestamp', 
+                        'x_otp_attempts (Integer) - Failed attempt counter'
                     ],
-                    'new_endpoints': [
-                        'GET /api/v1/user/details - Get user details',
-                        'POST /api/v1/user/update - Update user details', 
-                        'PUT /api/v1/user/{user_id} - Update user by ID',
-                        'POST /api/v1/user/logout - Logout user',
-                        'GET /api/v1/user/sessions - Get active sessions',
-                        'DELETE /api/v1/user/{user_id} - Soft delete user'
-                    ],
-                    'database_requirements': {
-                        'required_custom_fields': [
-                            'x_otp_code (Char) - Stores the OTP code',
-                            'x_otp_created_at (Datetime) - OTP creation timestamp',
-                            'x_otp_expires_at (Datetime) - OTP expiration timestamp', 
-                            'x_otp_attempts (Integer) - Failed attempt counter'
-                        ],
-                        'target_model': 'res.partner',
-                        'fields_exist': otp_fields_exist
-                    }
-                })
-            elif self.path == '/api/v1/user/details':
-                self.handle_get_user_details()
-            elif self.path == '/api/v1/user/sessions':
-                self.handle_get_active_sessions()
-            elif self.path.startswith('/api/v1/user/list'):
-                self.handle_get_user_list()
-            elif self.path.startswith('/api/v1/user/') and self.path.count('/') == 4 and self.command == 'GET':
-                user_id = self.path.split('/')[-1]
-                self.handle_get_user_by_id(user_id)
-            else:
-                logger.warning(f"404 Not Found for path: {self.path}")
-                self._send_response({'error': 'Not Found'}, 404)
-        except Exception as e:
-            logger.error(f"GET request failed: {str(e)}", exc_info=True)
-            self._send_response({'error': f'Internal server error: {str(e)}'}, 500)
-
+                    'target_model': 'res.partner',
+                    'fields_exist': otp_fields_exist
+                }
+            })
+        elif self.path == '/api/v1/user/details':
+            self.handle_get_user_details()
+        elif self.path == '/api/v1/user/sessions':
+            self.handle_get_active_sessions()
+        elif self.path.startswith('/api/v1/user/list'):
+            self.handle_get_user_list()
+        elif self.path.startswith('/api/v1/user/') and self.path.count('/') == 4 and self.command == 'GET':
+            # GET /api/v1/user/{user_id} - Get user by ID (excluding deleted)
+            user_id = self.path.split('/')[-1]
+            self.handle_get_user_by_id(user_id)
+        else:
+            logger.warning(f"404 Not Found for path: {self.path}")
+            self._send_response({'error': 'Not Found'}, 404)
     def handle_send_invoice_sms(self, data):
-        try:  # FIX: Wrap in try-except
-            print("[SMS SERVICE] ===============================")
-            print("[SMS SERVICE] Request received")
+        print("[SMS SERVICE] ===============================")
+        print("[SMS SERVICE] Request received")
 
+        try:
             order_name = data.get("order_name")
             customer_name = data.get("customer_name", "Anonymous")
             phone_number = data.get("phone_number")
@@ -865,7 +797,6 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             }, 500)
 
         except Exception as e:
-            logger.error(f"Invoice SMS failed: {str(e)}", exc_info=True)
             self._send_response({
                 "success": False,
                 "message": str(e)
@@ -874,6 +805,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
     def handle_get_user_list(self):
         """GET /api/v1/user/list?active=true|false - Get user list filtered by active status."""
         try:
+            # Parse query string for 'active' parameter
             from urllib.parse import urlparse, parse_qs
             query = urlparse(self.path).query
             params = parse_qs(query)
@@ -882,13 +814,12 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 active_value = False
             else:
                 active_value = True
-            
+            # Search for users with the given active status
             domain = [[('active', '=', active_value)]]
             user_ids = execute_odoo_kw_optimized('res.partner', 'search', domain, cache_key=f"user_list_{active_value}")
             if not user_ids:
                 self._send_response({'success': True, 'users': []}, 200)
                 return
-            
             users = execute_odoo_kw_optimized('res.partner', 'read', [user_ids, ['id', 'name', 'phone', 'email', 'function', 'vat', 'ref']], cache_key=f"user_list_data_{active_value}")
             user_list = []
             for user in users:
@@ -903,7 +834,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 })
             self._send_response({'success': True, 'users': user_list}, 200)
         except Exception as e:
-            logger.error(f"Get user list failed: {str(e)}", exc_info=True)
+            logger.error(f"Get user list failed: {str(e)}")
             self._send_response({'error': f'Get user list failed: {str(e)}'}, 500)
 
     def do_POST(self):
@@ -911,7 +842,6 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data.decode('utf-8'))
-            
             if self.path == '/api/v1/user/register':
                 self.handle_user_register(data)
             elif self.path == '/api/v1/user/login':
@@ -925,18 +855,16 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             elif self.path == '/api/v1/store-visit':
                 self.handle_store_visit(data)
             elif self.path.startswith('/api/v1/user/') and len(self.path.split('/')) == 5:
+                # Handle /api/v1/user/{user_id} for updating user by ID
                 user_id = self.path.split('/')[-1]
                 self.handle_update_user_by_id(data, user_id)
             elif self.path == "/api/v1/send-sms":
                 self.handle_send_invoice_sms(data)
             else:
                 self._send_response({'error': 'Not Found'}, 404)
-        except json.JSONDecodeError as je:
-            logger.error(f"Invalid JSON in request: {str(je)}", exc_info=True)
-            self._send_response({'error': 'Invalid JSON in request body'}, 400)
         except Exception as e:
-            logger.error(f"Request processing error: {str(e)}", exc_info=True)
-            self._send_response({'error': f'Request processing error: {str(e)}'}, 500)
+            logger.error(f"Request processing error: {str(e)}")
+            self._send_response({'error': f'Request processing error: {str(e)}'}, 400)
 
     def do_DELETE(self):
         try:
@@ -946,8 +874,8 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             else:
                 self._send_response({'error': 'Not Found'}, 404)
         except Exception as e:
-            logger.error(f"DELETE request processing error: {str(e)}", exc_info=True)
-            self._send_response({'error': f'Request processing error: {str(e)}'}, 500)
+            logger.error(f"DELETE request processing error: {str(e)}")
+            self._send_response({'error': f'Request processing error: {str(e)}'}, 400)
 
     def handle_soft_delete_user(self, user_id):
         """DELETE /api/v1/user/{user_id} - Soft delete user by setting active=False."""
@@ -957,24 +885,21 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 self._send_response({'error': 'Invalid user ID format'}, 400)
                 return
-            
+            # Check if user exists and is active
             user_exists = execute_odoo_kw_optimized('res.partner', 'search', [[('id', '=', user_id), ('active', '=', True)]], cache_key=f"user_exists_{user_id}")
             if not user_exists:
                 self._send_response({'error': 'User not found or already deleted'}, 404)
                 return
-            
-            execute_odoo_kw_optimized('res.partner', 'write', [[user_id], {'active': False}])
-            
-            # Clear cache
-            with cache_lock:
-                cache_key = f"user_exists_{user_id}"
-                cache_data.pop(cache_key, None)
-                cache_timestamps.pop(cache_key, None)
-            
+            # Soft delete: set active=False
+            execute_odoo_kw('res.partner', 'write', [[user_id], {'active': False}])
+            # Clear cache for this user
+            cache_key = f"user_exists_{user_id}"
+            cache_data.pop(cache_key, None)
+            cache_timestamps.pop(cache_key, None)
             logger.info(f"User {user_id} soft deleted successfully")
             self._send_response({'success': True, 'message': f'User {user_id} deleted (soft) successfully'}, 200)
         except Exception as e:
-            logger.error(f"Soft delete user failed: {str(e)}", exc_info=True)
+            logger.error(f"Soft delete user failed: {str(e)}")
             self._send_response({'error': f'Soft delete user failed: {str(e)}'}, 500)
 
     def handle_get_user_by_id(self, user_id):
@@ -985,13 +910,11 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 self._send_response({'error': 'Invalid user ID format'}, 400)
                 return
-            
             user_exists = execute_odoo_kw_optimized('res.partner', 'search', [[('id', '=', user_id), ('active', '=', True)]], cache_key=f"user_exists_{user_id}")
             if not user_exists:
                 self._send_response({'error': 'User not found or deleted'}, 404)
                 return
-            
-            user_data = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['name', 'phone', 'email', 'function', 'vat', 'ref']])[0]
+            user_data = execute_odoo_kw('res.partner', 'read', [user_id, ['name', 'phone', 'email', 'function', 'vat', 'ref']])[0]
             api_user_data = {
                 'id': user_data['id'],
                 'name': user_data['name'],
@@ -1003,14 +926,13 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             }
             self._send_response({'success': True, 'data': api_user_data}, 200)
         except Exception as e:
-            logger.error(f"Get user by ID failed: {str(e)}", exc_info=True)
+            logger.error(f"Get user by ID failed: {str(e)}")
             self._send_response({'error': f'Get user by ID failed: {str(e)}'}, 500)
 
     def handle_user_register(self, data):
         try:
             phone = data.get('phone')
             email = data.get('email')
-            
             if phone:
                 cache_key = f"user_exists_phone_{phone}"
                 existing_users = execute_odoo_kw_optimized('res.partner', 'search', [[('phone', '=', phone), ('active', '=', True)]], cache_key=cache_key)
@@ -1028,13 +950,14 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 'name': data.get('name', 'Unknown User'),
                 'phone': phone,
                 'email': email or '',
-                'function': data.get('last_name', ''),
-                'vat': data.get('birthday', ''),
-                'ref': data.get('identification_id', ''),
+                'function': data.get('last_name', ''),  # Using function field for last_name
+                'vat': data.get('birthday', ''),  # Using vat field for birthday (plain text)
+                'ref': data.get('identification_id', ''),  # Using ref field for identification_id
             }
             
             user_id = execute_odoo_kw_optimized('res.partner', 'create', [user_data])
             
+            # Map response back to API field names
             api_response_data = {
                 'name': data.get('name', 'Unknown User'),
                 'phone': phone,
@@ -1048,7 +971,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             self._send_response({'success': True, 'message': 'User registered successfully', 'user_id': user_id, 'data': api_response_data}, 201)
             
         except Exception as e:
-            logger.error(f"Registration failed: {str(e)}", exc_info=True)
+            logger.error(f"Registration failed: {str(e)}")
             self._send_response({'error': f'Registration failed: {str(e)}'}, 500)
 
     def handle_user_login(self, data):
@@ -1056,6 +979,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             logger.info("="*60)
             logger.info("NEW LOGIN REQUEST - SEND OTP")
             logger.info(f"Request data: {json.dumps(data, indent=2)}")
+            logger.info(f"Request headers: {dict(self.headers)}")
             
             phone_or_email = data.get('phone_or_email')
             if not phone_or_email:
@@ -1065,9 +989,10 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
 
             logger.info(f"Login attempt for: {phone_or_email}")
 
+            # Find user by phone or email
             domain = ['&', '|', ('phone', '=', phone_or_email), ('email', '=', phone_or_email), ('active', '=', True)]
             logger.info(f"Searching user with domain: {domain}")
-            user_ids = execute_odoo_kw_optimized('res.partner', 'search', [domain])
+            user_ids = execute_odoo_kw('res.partner', 'search', [domain])
             logger.info(f"User search result: {user_ids}")
             
             if not user_ids:
@@ -1078,7 +1003,8 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             user_id = user_ids[0]
             logger.info(f"User found: ID={user_id}")
             
-            user = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['phone', 'name', 'email']])[0]
+            # Fetch phone to send OTP
+            user = execute_odoo_kw('res.partner', 'read', [user_id, ['phone', 'name', 'email']])[0]
             logger.info(f"User details: name={user.get('name')}, phone={user.get('phone')}, email={user.get('email')}")
             
             phone_value = user.get('phone') or (phone_or_email if '@' not in str(phone_or_email) else None)
@@ -1092,6 +1018,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send_response({'error': 'User does not have a valid phone number for OTP'}, 400)
                 return
 
+            # Generate and store OTP
             otp = _generate_otp(6)
             logger.info(f"Generated OTP: {otp} for user_id={user_id}")
             
@@ -1099,6 +1026,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             _put_otp(sanitized, otp, user_id)
             logger.info(f"OTP stored successfully")
 
+            # Send OTP via 019SMS with dynamic code
             logger.info(f"Attempting to send SMS to: {phone_value}")
             ok, err = _send_otp_via_019sms(phone_value, otp)
             logger.info(f"SMS send result: success={ok}, error={err}")
@@ -1122,6 +1050,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             logger.info("="*60)
             logger.info("NEW VERIFY REQUEST")
             logger.info(f"Request data: {json.dumps(data, indent=2)}")
+            logger.info(f"Request headers: {dict(self.headers)}")
             
             phone_or_email = data.get('phone_or_email')
             otp = data.get('otp')
@@ -1133,9 +1062,10 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
 
             logger.info(f"Verify attempt for: {phone_or_email} with OTP: {otp}")
 
+            # Resolve user and target phone used for OTP
             domain = ['&', '|', ('phone', '=', phone_or_email), ('email', '=', phone_or_email), ('active', '=', True)]
             logger.info(f"Searching user with domain: {domain}")
-            user_ids = execute_odoo_kw_optimized('res.partner', 'search', [domain])
+            user_ids = execute_odoo_kw('res.partner', 'search', [domain])
             logger.info(f"User search result: {user_ids}")
             
             if not user_ids:
@@ -1146,7 +1076,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             user_id = user_ids[0]
             logger.info(f"User found: ID={user_id}")
             
-            user = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['name', 'phone', 'email']])[0]
+            user = execute_odoo_kw('res.partner', 'read', [user_id, ['name', 'phone', 'email']])[0]
             logger.info(f"User details: name={user.get('name')}, phone={user.get('phone')}, email={user.get('email')}")
             
             phone_value = user.get('phone') or (phone_or_email if '@' not in str(phone_or_email) else None)
@@ -1158,6 +1088,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send_response({'error': 'User does not have a valid phone number for OTP'}, 400)
                 return
 
+            # Validate OTP from store
             logger.info(f"Validating OTP: {otp} for sanitized phone: {sanitized}")
             ok, matched_user_id, err = _get_and_validate_otp(sanitized, str(otp))
             logger.info(f"OTP validation result: success={ok}, matched_user_id={matched_user_id}, error={err}")
@@ -1172,6 +1103,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send_response({'error': 'OTP does not match user'}, 401)
                 return
 
+            # Issue JWT and create session
             current_time = int(time.time())
             payload = {
                 'user_id': user_id,
@@ -1228,7 +1160,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 return
             
             user_id = decoded_token['user_id']
-            user_data = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['name', 'phone', 'email']])[0]
+            user_data = execute_odoo_kw('res.partner', 'read', [user_id, ['name', 'phone', 'email']])[0]
             
             visit_data = {
                 'name': data.get('name', user_data.get('name', 'Anonymous Visit')),
@@ -1243,8 +1175,8 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             if data.get('warehouse_id'):
                 visit_data['warehouse_id'] = data['warehouse_id']
             
-            visit_id = execute_odoo_kw_optimized('store.visit', 'create', [visit_data])
-            created_visit = execute_odoo_kw_optimized('store.visit', 'read', [visit_id])[0]
+            visit_id = execute_odoo_kw('store.visit', 'create', [visit_data])
+            created_visit = execute_odoo_kw('store.visit', 'read', [visit_id])[0]
             
             logger.info(f"Store visit created with ID: {visit_id} by user {user_id}")
             self._send_response({
@@ -1255,9 +1187,10 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             }, 201)
             
         except Exception as e:
-            logger.error(f"Store visit creation failed: {str(e)}", exc_info=True)
+            logger.error(f"Store visit creation failed: {str(e)}")
             self._send_response({'error': f'Store visit creation failed: {str(e)}'}, 500)
 
+    # NEW API 1: GET /api/v1/user/details - Get authenticated user's details
     def handle_get_user_details(self):
         """GET /api/v1/user/details - Get authenticated user's details."""
         try:
@@ -1280,18 +1213,21 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 return
             
             user_id = decoded_token['user_id']
-            user_data = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['name', 'phone', 'email', 'function', 'vat', 'ref']])[0]
+            # Fetch all user fields including the optional ones stored in Odoo fields
+            user_data = execute_odoo_kw('res.partner', 'read', [user_id, ['name', 'phone', 'email', 'function', 'vat', 'ref']])[0]
             
+            # Map back to API field names and include all optional fields
             api_user_data = {
                 'id': user_data['id'],
                 'name': user_data['name'],
                 'phone': user_data['phone'],
                 'email': user_data['email'],
-                'last_name': user_data.get('function', ''),
-                'birthday': user_data.get('vat', ''),
-                'identification_id': user_data.get('ref', '')
+                'last_name': user_data.get('function', ''),  # last_name stored in function field
+                'birthday': user_data.get('vat', ''),        # birthday stored in vat field
+                'identification_id': user_data.get('ref', '') # identification_id stored in ref field
             }
             
+            # Get session information for compatibility
             session_info = {
                 'user_id': user_id,
                 'token_expires': decoded_token['exp'],
@@ -1299,16 +1235,18 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             }
             
             logger.info(f"User details retrieved for user ID: {user_id}")
+            # Use 'data' as the main property (not 'user_data')
             self._send_response({
                 'success': True,
                 'data': api_user_data,
-                'session_info': session_info
+                'session_info': session_info  # Additional session info for compatibility
             }, 200)
             
         except Exception as e:
-            logger.error(f"Get user details failed: {str(e)}", exc_info=True)
+            logger.error(f"Get user details failed: {str(e)}")
             self._send_response({'error': f'Get user details failed: {str(e)}'}, 500)
 
+    # NEW API 2: POST /api/v1/user/update - Update authenticated user's details
     def handle_user_update(self, data):
         """POST /api/v1/user/update - Update authenticated user's details."""
         try:
@@ -1336,31 +1274,32 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             if 'name' in data:
                 update_data['name'] = data['name']
             if 'phone' in data:
-                existing_users = execute_odoo_kw_optimized('res.partner', 'search', [[('phone', '=', data['phone']), ('id', '!=', user_id)]])
+                existing_users = execute_odoo_kw('res.partner', 'search', [[('phone', '=', data['phone']), ('id', '!=', user_id)]])
                 if existing_users:
                     self._send_response({'error': 'Phone number already in use by another user'}, 409)
                     return
                 update_data['phone'] = data['phone']
             if 'email' in data:
-                existing_users = execute_odoo_kw_optimized('res.partner', 'search', [[('email', '=', data['email']), ('id', '!=', user_id)]])
+                existing_users = execute_odoo_kw('res.partner', 'search', [[('email', '=', data['email']), ('id', '!=', user_id)]])
                 if existing_users:
                     self._send_response({'error': 'Email already in use by another user'}, 409)
                     return
                 update_data['email'] = data['email']
             if 'last_name' in data:
-                update_data['function'] = data['last_name']
+                update_data['function'] = data['last_name']  # Map last_name to function
             if 'birthday' in data:
-                update_data['vat'] = data['birthday']
+                update_data['vat'] = data['birthday']  # Map birthday to vat (plain text)
             if 'identification_id' in data:
-                update_data['ref'] = data['identification_id']
+                update_data['ref'] = data['identification_id']  # Map identification_id to ref
             
             if not update_data:
                 self._send_response({'error': 'No valid fields to update'}, 400)
                 return
             
-            execute_odoo_kw_optimized('res.partner', 'write', [[user_id], update_data])
-            updated_user_data = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['name', 'phone', 'email', 'function', 'vat', 'ref']])[0]
+            execute_odoo_kw('res.partner', 'write', [[user_id], update_data])
+            updated_user_data = execute_odoo_kw('res.partner', 'read', [user_id, ['name', 'phone', 'email', 'function', 'vat', 'ref']])[0]
             
+            # Map back to API field names with HTML stripping for birthday
             api_updated_data = {
                 'id': updated_user_data['id'],
                 'name': updated_user_data['name'],
@@ -1371,11 +1310,10 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 'identification_id': updated_user_data.get('ref', '')
             }
             
-            with active_sessions_lock:
-                for session_id, session_data in active_sessions.items():
-                    if session_data['token'] == token:
-                        session_data['user_data'] = api_updated_data
-                        break
+            for session_id, session_data in active_sessions.items():
+                if session_data['token'] == token:
+                    session_data['user_data'] = api_updated_data
+                    break
             
             logger.info(f"User details updated for user ID: {user_id}")
             self._send_response({
@@ -1385,9 +1323,10 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             }, 200)
             
         except Exception as e:
-            logger.error(f"User update failed: {str(e)}", exc_info=True)
+            logger.error(f"User update failed: {str(e)}")
             self._send_response({'error': f'User update failed: {str(e)}'}, 500)
 
+    # NEW API 3: POST /api/v1/user/logout - Logout user and invalidate session
     def handle_user_logout(self, data):
         """POST /api/v1/user/logout - Logout user and invalidate session."""
         try:
@@ -1419,9 +1358,10 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             }, 200)
             
         except Exception as e:
-            logger.error(f"Logout failed: {str(e)}", exc_info=True)
+            logger.error(f"Logout failed: {str(e)}")
             self._send_response({'error': f'Logout failed: {str(e)}'}, 500)
 
+    # NEW API 4: GET /api/v1/user/sessions - Get active sessions
     def handle_get_active_sessions(self):
         """GET /api/v1/user/sessions - Get active sessions."""
         try:
@@ -1446,41 +1386,40 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             cleanup_expired_sessions()
             
             sessions_info = []
-            with active_sessions_lock:
-                for session_id, session_data in active_sessions.items():
-                    sessions_info.append({
-                        'session_id': session_id,
-                        'user_id': session_data['user_id'],
-                        'user_name': session_data['user_data'].get('name', 'Unknown'),
-                        'created_at': session_data['created_at'].isoformat(),
-                        'last_activity': session_data['last_activity'].isoformat(),
-                        'is_current': session_data['token'] == token
-                    })
-            
-            with blacklisted_tokens_lock:
-                blacklist_count = len(blacklisted_tokens)
+            for session_id, session_data in active_sessions.items():
+                sessions_info.append({
+                    'session_id': session_id,
+                    'user_id': session_data['user_id'],
+                    'user_name': session_data['user_data'].get('name', 'Unknown'),
+                    'created_at': session_data['created_at'].isoformat(),
+                    'last_activity': session_data['last_activity'].isoformat(),
+                    'is_current': session_data['token'] == token
+                })
             
             logger.info(f"Active sessions retrieved by user: {decoded_token['user_id']}")
             self._send_response({
                 'success': True,
                 'active_sessions_count': len(sessions_info),
                 'sessions': sessions_info,
-                'blacklisted_tokens_count': blacklist_count
+                'blacklisted_tokens_count': len(blacklisted_tokens)
             }, 200)
             
         except Exception as e:
-            logger.error(f"Get active sessions failed: {str(e)}", exc_info=True)
+            logger.error(f"Get active sessions failed: {str(e)}")
             self._send_response({'error': f'Get active sessions failed: {str(e)}'}, 500)
 
+    # NEW API 5: POST/PUT /api/v1/user/{user_id} - Update user details by ID
     def handle_update_user_by_id(self, data, user_id):
         """POST/PUT /api/v1/user/{user_id} - Update user details by their ID."""
         try:
+            # Validate user_id is numeric
             try:
                 user_id = int(user_id)
             except ValueError:
                 self._send_response({'error': 'Invalid user ID format'}, 400)
                 return
             
+            # Check if user exists
             user_exists = execute_odoo_kw_optimized('res.partner', 'search', 
                                                    [[('id', '=', user_id), ('active', '=', True)]], 
                                                    cache_key=f"user_exists_{user_id}")
@@ -1488,13 +1427,15 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send_response({'error': 'User not found'}, 404)
                 return
             
+            # Prepare update data with field mapping
             update_data = {}
             
             if 'name' in data:
                 update_data['name'] = data['name']
                 
             if 'phone' in data:
-                existing_users = execute_odoo_kw_optimized('res.partner', 'search', 
+                # Check if phone is already used by another user
+                existing_users = execute_odoo_kw('res.partner', 'search', 
                                                 [[('phone', '=', data['phone']), ('id', '!=', user_id)]])
                 if existing_users:
                     self._send_response({'error': 'Phone number already in use by another user'}, 409)
@@ -1502,7 +1443,8 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 update_data['phone'] = data['phone']
                 
             if 'email' in data:
-                existing_users = execute_odoo_kw_optimized('res.partner', 'search', 
+                # Check if email is already used by another user
+                existing_users = execute_odoo_kw('res.partner', 'search', 
                                                 [[('email', '=', data['email']), ('id', '!=', user_id)]])
                 if existing_users:
                     self._send_response({'error': 'Email already in use by another user'}, 409)
@@ -1510,23 +1452,26 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 update_data['email'] = data['email']
                 
             if 'last_name' in data:
-                update_data['function'] = data['last_name']
+                update_data['function'] = data['last_name']  # Map last_name to function field
                 
             if 'birthday' in data:
-                update_data['vat'] = data['birthday']
+                update_data['vat'] = data['birthday']  # Map birthday to vat field
                 
             if 'identification_id' in data:
-                update_data['ref'] = data['identification_id']
+                update_data['ref'] = data['identification_id']  # Map identification_id to ref field
             
             if not update_data:
                 self._send_response({'error': 'No valid fields to update'}, 400)
                 return
             
-            execute_odoo_kw_optimized('res.partner', 'write', [[user_id], update_data])
+            # Update the user
+            execute_odoo_kw('res.partner', 'write', [[user_id], update_data])
             
-            updated_user_data = execute_odoo_kw_optimized('res.partner', 'read', 
+            # Fetch updated user data
+            updated_user_data = execute_odoo_kw('res.partner', 'read', 
                                               [user_id, ['name', 'phone', 'email', 'function', 'vat', 'ref']])[0]
             
+            # Map back to API field names
             api_updated_data = {
                 'id': updated_user_data['id'],
                 'name': updated_user_data['name'],
@@ -1537,9 +1482,9 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 'identification_id': updated_user_data.get('ref', '')
             }
             
-            # Clear cache
-            with cache_lock:
-                cache_key = f"user_exists_{user_id}"
+            # Clear cache for this user
+            cache_key = f"user_exists_{user_id}"
+            if cache_key in cache_data:
                 cache_data.pop(cache_key, None)
                 cache_timestamps.pop(cache_key, None)
             
@@ -1551,78 +1496,52 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             }, 200)
             
         except Exception as e:
-            logger.error(f"Update user by ID failed: {str(e)}", exc_info=True)
+            logger.error(f"Update user by ID failed: {str(e)}")
             self._send_response({'error': f'Update user by ID failed: {str(e)}'}, 500)
 
-    # FIX: Add log_message override to prevent broken pipe errors from flooding logs
-    def log_message(self, format, *args):
-        """Override to add error handling for logging"""
-        try:
-            super().log_message(format, *args)
-        except Exception:
-            pass  # Silently ignore logging errors
-
+# --- Clean run() override to ensure valid startup logs/prints ---
 def run(server_class=http.server.HTTPServer, handler_class=EnhancedApiHandler, port=8001):
-    """Start server with error handling"""
-    try:
-        server_address = (
-            config.get('server', 'host', fallback='0.0.0.0'),
-            config.getint('server', 'port', fallback=8001)
-        )
-        httpd = server_class(server_address, handler_class)
+    server_address = (
+        config.get('server', 'host', fallback='0.0.0.0'),
+        config.getint('server', 'port', fallback=8001)
+    )
+    httpd = server_class(server_address, handler_class)
 
-        logger.info(
-            f"Starting OPTIMIZED Enhanced API server on {server_address[0]}:{server_address[1]}..."
-        )
-        logger.info(f"Connected to Odoo: {ODOO_URL}")
-        logger.info(f"Database: {ODOO_DB}")
-        logger.info("PERFORMANCE OPTIMIZATIONS ACTIVE:")
-        logger.info("   - Connection pooling (10 min TTL)")
-        logger.info("   - Response caching (5 min TTL)")
-        logger.info("   - Optimized session management")
-        logger.info("   - 019SMS OTP integration with dynamic codes")
-        logger.info("   - Thread-safe operations")
-        logger.info("   - Fixed mutable defaults bug")
-        logger.info("NEW ENDPOINTS AVAILABLE:")
-        logger.info("   1. GET /api/v1/user/details - Get authenticated user's details")
-        logger.info("   2. POST /api/v1/user/update - Update authenticated user's details")
-        logger.info("   3. POST/PUT /api/v1/user/{user_id} - Update user by ID")
-        logger.info("   4. POST /api/v1/user/logout - Logout user and invalidate session")
-        logger.info("   5. GET /api/v1/user/sessions - Get active sessions")
-        logger.info("   6. DELETE /api/v1/user/{user_id} - Soft delete user")
-        logger.info("   7. GET /api/v1/user/list - Get user list")
+    logger.info(
+        f"Starting OPTIMIZED Enhanced API server on {server_address[0]}:{server_address[1]}..."
+    )
+    logger.info(f"Connected to Odoo: {ODOO_URL}")
+    logger.info(f"Database: {ODOO_DB}")
+    logger.info("PERFORMANCE OPTIMIZATIONS ACTIVE:")
+    logger.info("   - Connection pooling (10 min TTL)")
+    logger.info("   - Response caching (5 min TTL)")
+    logger.info("   - Optimized session management")
+    logger.info("   - 019SMS OTP integration with dynamic codes")
+    logger.info("NEW ENDPOINTS AVAILABLE:")
+    logger.info("   1. GET /api/v1/user/details - Get authenticated user's details")
+    logger.info("   2. POST /api/v1/user/update - Update authenticated user's details")
+    logger.info("   3. POST/PUT /api/v1/user/{user_id} - Update user by ID")
+    logger.info("   4. POST /api/v1/user/logout - Logout user and invalidate session")
+    logger.info("   5. GET /api/v1/user/sessions - Get active sessions")
+    logger.info("   6. DELETE /api/v1/user/{user_id} - Soft delete user")
+    logger.info("   7. GET /api/v1/user/list - Get user list")
 
-        print("=" * 70)
-        print("OPTIMIZED ENHANCED STORE API SERVER STARTING...")
-        print("=" * 70)
-        print(f"Odoo Server: {ODOO_URL}")
-        print(f"Database: {ODOO_DB}")
-        print(f"API Port: {server_address[1]}")
-        print("PERFORMANCE OPTIMIZATIONS:")
-        print("   - Connection pooling enabled")
-        print("   - Response caching (5 min TTL)")
-        print("   - Optimized session management")
-        print("   - Reduced logging overhead")
-        print("   - 019SMS OTP integration with dynamic codes")
-        print("   - Thread-safe operations")
-        print("   - Fixed mutable defaults bug")
-        print("7 NEW ENDPOINTS READY!")
-        print("=" * 70)
+    print("=" * 70)
+    print("OPTIMIZED ENHANCED STORE API SERVER STARTING...")
+    print("=" * 70)
+    print(f"Odoo Server: {ODOO_URL}")
+    print(f"Database: {ODOO_DB}")
+    print(f"API Port: {server_address[1]}")
+    print("PERFORMANCE OPTIMIZATIONS:")
+    print("   - Connection pooling enabled")
+    print("   - Response caching (5 min TTL)")
+    print("   - Optimized session management")
+    print("   - Reduced logging overhead")
+    print("   - 019SMS OTP integration with dynamic codes")
+    print("7 NEW ENDPOINTS READY!")
+    print("=" * 70)
 
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("Server shutdown requested")
-        print("\nServer shutdown requested")
-    except Exception as e:
-        logger.error(f"Server failed to start: {str(e)}", exc_info=True)
-        print(f"FATAL ERROR: {str(e)}")
-        raise
+    httpd.serve_forever()
 
 if __name__ == '__main__':
-    try:
-        run()
-    except Exception as e:
-        logger.error(f"Fatal error in main: {str(e)}", exc_info=True)
-        print(f"FATAL ERROR: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    run()
