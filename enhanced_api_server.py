@@ -180,7 +180,7 @@ def _cleanup_expired_otps():
         'res.partner', 'search',
         [[
             ('x_otp_expires_at', '!=', False),
-            ('x_otp_expires_at', '<', current_time.isoformat())
+            ('x_otp_expires_at', '<', current_timestrftime("%Y-%m-%d %H:%M:%S"))
         ]]
         )
         
@@ -239,7 +239,7 @@ def _validate_otp_from_partner(phone_or_email: str, otp: str) -> tuple[bool, int
             '|', ('phone', '=', phone_or_email), ('email', '=', phone_or_email),
             ('active', '=', True),
             ('x_otp_code', '!=', False),
-            ('x_otp_expires_at', '>', current_time.isoformat())
+            ('x_otp_expires_at', '>', current_timestrftime("%Y-%m-%d %H:%M:%S"))
         ]
         
         user_ids = execute_odoo_kw('res.partner', 'search', [domain])
@@ -311,12 +311,12 @@ def _get_otp_stats() -> dict:
         # Count active OTPs
         active_otps = len(execute_odoo_kw('res.partner', 'search', [[
             ('x_otp_code', '!=', False),
-            ('x_otp_expires_at', '>', current_time.isoformat())
+            ('x_otp_expires_at', '>', current_timestrftime("%Y-%m-%d %H:%M:%S"))
         ]]))
 
         expired_otps = len(execute_odoo_kw('res.partner', 'search', [[
             ('x_otp_code', '!=', False),
-            ('x_otp_expires_at', '<', current_time.isoformat())
+            ('x_otp_expires_at', '<', current_timestrftime("%Y-%m-%d %H:%M:%S"))
         ]]))
 
         
