@@ -963,14 +963,19 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send_response({'error': 'User not found or already deleted'}, 404)
                 return
             
-            execute_odoo_kw_optimized('res.partner', 'write', [[user_id], {'active': False}])
+            user_info = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['phone', 'email']])[0]
             
             # Clear cache
             with cache_lock:
-                cache_key = f"user_exists_{user_id}"
-                cache_data.pop(cache_key, None)
-                cache_timestamps.pop(cache_key, None)
-            
+                cache_data.pop(f"user_exists_{user_id}", None)
+                cache_timestamps.pop(f"user_exists_{user_id}", None)
+                if user_info.get('phone'):
+                    cache_data.pop(f"user_exists_phone_{user_info['phone']}", None)
+                    cache_timestamps.pop(f"user_exists_phone_{user_info['phone']}", None)
+                    if user_info.get('email'):
+                        cache_data.pop(f"user_exists_email_{user_info['email']}", None)
+                        cache_timestamps.pop(f"user_exists_email_{user_info['email']}", None)
+            execute_odoo_kw_optimized('res.partner', 'write', [[user_id], {'active': False}])
             logger.info(f"User {user_id} soft deleted successfully")
             self._send_response({'success': True, 'message': f'User {user_id} deleted (soft) successfully'}, 200)
         except Exception as e:
@@ -1010,20 +1015,94 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
         try:
             phone = data.get('phone')
             email = data.get('email')
-            
+
+            # --- FIX 2 & 3: Search both active AND inactive records ---
+            # active_test=False tells Odoo to include soft-deleted (active=False) records in search.
+            # This prevents creating duplicate res.partner records for the same phone/email.
+
+            # Step 1: Check if an ACTIVE user already exists → reject immediately (409)
             if phone:
-                cache_key = f"user_exists_phone_{phone}"
-                existing_users = execute_odoo_kw_optimized('res.partner', 'search', [[('phone', '=', phone), ('active', '=', True)]], cache_key=cache_key)
-                if existing_users:
+                active_users = execute_odoo_kw_optimized(
+                    'res.partner', 'search',
+                    [[('phone', '=', phone), ('active', '=', True)]]
+                )
+                if active_users:
                     self._send_response({'error': 'User with this phone already exists'}, 409)
                     return
+
             if email:
-                cache_key = f"user_exists_email_{email}"
-                existing_users = execute_odoo_kw_optimized('res.partner', 'search', [[('email', '=', email), ('active', '=', True)]], cache_key=cache_key)
-                if existing_users:
+                active_users = execute_odoo_kw_optimized(
+                    'res.partner', 'search',
+                    [[('email', '=', email), ('active', '=', True)]]
+                )
+                if active_users:
                     self._send_response({'error': 'User with this email already exists'}, 409)
                     return
 
+            # Step 2: Check if a SOFT-DELETED user exists for same phone/email → reactivate it
+            # Without active_test=False, Odoo's search silently skips inactive records.
+            inactive_user_id = None
+            if phone:
+                inactive_users = execute_odoo_kw_optimized(
+                    'res.partner', 'search',
+                    [[('phone', '=', phone), ('active', '=', False)]],
+                    {'context': {'active_test': False}}
+                )
+                if inactive_users:
+                    inactive_user_id = inactive_users[0]
+
+            if not inactive_user_id and email:
+                inactive_users = execute_odoo_kw_optimized(
+                    'res.partner', 'search',
+                    [[('email', '=', email), ('active', '=', False)]],
+                    {'context': {'active_test': False}}
+                )
+                if inactive_users:
+                    inactive_user_id = inactive_users[0]
+
+            if inactive_user_id:
+                # Reactivate the old record and update its fields with the new registration data
+                reactivate_data = {
+                    'active': True,
+                    'name': data.get('name', 'Unknown User'),
+                    'phone': phone,
+                    'email': email or '',
+                    'function': data.get('last_name', ''),
+                    'vat': data.get('birthday', ''),
+                    'ref': data.get('identification_id', ''),
+                }
+                execute_odoo_kw_optimized('res.partner', 'write', [[inactive_user_id], reactivate_data])
+
+                # Clear any stale cache for this user
+                with cache_lock:
+                    cache_data.pop(f"user_exists_{inactive_user_id}", None)
+                    cache_timestamps.pop(f"user_exists_{inactive_user_id}", None)
+                    if phone:
+                        cache_data.pop(f"user_exists_phone_{phone}", None)
+                        cache_timestamps.pop(f"user_exists_phone_{phone}", None)
+                    if email:
+                        cache_data.pop(f"user_exists_email_{email}", None)
+                        cache_timestamps.pop(f"user_exists_email_{email}", None)
+
+                api_response_data = {
+                    'name': data.get('name', 'Unknown User'),
+                    'phone': phone,
+                    'email': email or '',
+                    'last_name': data.get('last_name', ''),
+                    'birthday': data.get('birthday', ''),
+                    'identification_id': data.get('identification_id', '')
+                }
+
+                logger.info(f"Reactivated soft-deleted user ID: {inactive_user_id}")
+                self._send_response({
+                    'success': True,
+                    'message': 'User re-registered successfully',
+                    'user_id': inactive_user_id,
+                    'data': api_response_data
+                }, 201)
+                return
+
+            # Step 3: No existing record at all → create fresh
             user_data = {
                 'name': data.get('name', 'Unknown User'),
                 'phone': phone,
@@ -1032,9 +1111,9 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 'vat': data.get('birthday', ''),
                 'ref': data.get('identification_id', ''),
             }
-            
+
             user_id = execute_odoo_kw_optimized('res.partner', 'create', [user_data])
-            
+
             api_response_data = {
                 'name': data.get('name', 'Unknown User'),
                 'phone': phone,
@@ -1043,13 +1122,19 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 'birthday': data.get('birthday', ''),
                 'identification_id': data.get('identification_id', '')
             }
-            
+
             logger.info(f"Successfully registered new user with ID: {user_id}")
-            self._send_response({'success': True, 'message': 'User registered successfully', 'user_id': user_id, 'data': api_response_data}, 201)
-            
+            self._send_response({
+                'success': True,
+                'message': 'User registered successfully',
+                'user_id': user_id,
+                'data': api_response_data
+            }, 201)
+
         except Exception as e:
             logger.error(f"Registration failed: {str(e)}", exc_info=True)
             self._send_response({'error': f'Registration failed: {str(e)}'}, 500)
+
 
     def handle_user_login(self, data):
         try:
@@ -1062,9 +1147,9 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 logger.warning("LOGIN FAILED: Missing phone_or_email")
                 self._send_response({'error': 'Phone or email is required'}, 400)
                 return
-
+ 
             logger.info(f"Login attempt for: {phone_or_email}")
-
+ 
             domain = ['&', '|', ('phone', '=', phone_or_email), ('email', '=', phone_or_email), ('active', '=', True)]
             logger.info(f"Searching user with domain: {domain}")
             user_ids = execute_odoo_kw_optimized('res.partner', 'search', [domain])
@@ -1074,7 +1159,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 logger.warning(f"LOGIN FAILED: User not found for {phone_or_email}")
                 self._send_response({'error': 'User not found'}, 404)
                 return
-
+ 
             user_id = user_ids[0]
             logger.info(f"User found: ID={user_id}")
             
@@ -1091,7 +1176,9 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 logger.error("LOGIN FAILED: Invalid phone number")
                 self._send_response({'error': 'User does not have a valid phone number for OTP'}, 400)
                 return
-            if phone_value=='0000001234':
+            IS_DEMO_USER = sanitized == '0000001234'  # compare digits-only to avoid format mismatch
+ 
+            if IS_DEMO_USER:
                 otp = 123456
             else:
                 otp = _generate_otp(6)
@@ -1100,9 +1187,9 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             logger.info(f"Storing OTP in database/storage...")
             _put_otp(sanitized, otp, user_id)
             logger.info(f"OTP stored successfully")
-
-            if phone_value == '0000001234':
-                logger.info(f"Skipping SMS for test number: {phone_value}")
+ 
+            if IS_DEMO_USER:
+                logger.info(f"Skipping SMS for demo number: {phone_value} (sanitized: {sanitized})")
                 logger.info(f"✅ LOGIN SUCCESS (TEST MODE): OTP generated for user_id={user_id}")
                 logger.info("="*60)
                 self._send_response({
@@ -1120,7 +1207,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 logger.error(f"LOGIN FAILED: SMS send failed - {err}")
                 self._send_response({'error': f'Failed to send OTP: {err}'}, 502)
                 return
-
+ 
             logger.info(f"✅ LOGIN SUCCESS: OTP sent to user_id={user_id}")
             logger.info("="*60)
             self._send_response({'success': True, 'message': 'OTP sent successfully', 'user_id': user_id}, 200)
@@ -1128,6 +1215,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             logger.error(f"❌ LOGIN EXCEPTION: {str(e)}", exc_info=True)
             logger.info("="*60)
             self._send_response({'error': f'Login failed: {str(e)}'}, 500)
+
 
 
     def handle_user_verify(self, data):
