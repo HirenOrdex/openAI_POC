@@ -199,6 +199,13 @@ active_sessions_lock = threading.RLock()  # FIX: Add lock for sessions
 blacklisted_tokens = set()
 blacklisted_tokens_lock = threading.RLock()  # FIX: Add lock for blacklist
 
+
+refresh_tokens: dict = {}           # { refresh_token_str: { user_id, exp } }
+refresh_tokens_lock = threading.RLock()
+ 
+ACCESS_TOKEN_TTL  = 24 * 60 * 60   # 24 hours  (seconds)
+REFRESH_TOKEN_TTL = 7  * 24 * 60 * 60  # 7 days (seconds)
+
 # --- Database-Level OTP Management using res.partner ---
 OTP_TTL_SECONDS = 300  # 5 minutes
 MAX_OTP_ATTEMPTS = 3  # Maximum OTP validation attempts
@@ -922,6 +929,8 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 self.handle_user_update(data)
             elif self.path == '/api/v1/user/logout':
                 self.handle_user_logout(data)
+            elif self.path == '/api/v1/user/refresh':
+                self.handle_user_refresh(data)
             elif self.path == '/api/v1/store-visit':
                 self.handle_store_visit(data)
             elif self.path.startswith('/api/v1/user/') and len(self.path.split('/')) == 5:
@@ -1217,7 +1226,50 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             self._send_response({'error': f'Login failed: {str(e)}'}, 500)
 
 
-
+    def _generate_tokens_for_user(self, user_id, user):
+        """
+        Issues a new access token (24 h) + refresh token (7 d).
+        Stores the refresh token in the in-memory store.
+        Returns (access_token, refresh_token, session_id).
+        """
+        import secrets as _secrets  # already imported at top level, this is a reminder
+    
+        current_time = int(time.time())
+    
+        # --- Access token (short-lived) ---
+        access_payload = {
+            'user_id': user_id,
+            'phone':   user.get('phone'),
+            'email':   user.get('email'),
+            'name':    user.get('name'),
+            'iat':     current_time,
+            'exp':     current_time + ACCESS_TOKEN_TTL,  # 24 h
+            'type':    'access',
+        }
+        access_token = jwt.encode(access_payload, JWT_SECRET, algorithm='HS256')
+    
+        # --- Refresh token (long-lived, opaque) ---
+        raw_refresh = secrets.token_hex(32)
+        refresh_payload = {
+            'user_id': user_id,
+            'iat':     current_time,
+            'exp':     current_time + REFRESH_TOKEN_TTL,  # 7 d
+            'type':    'refresh',
+            'jti':     raw_refresh,   # unique identifier so it can be revoked
+        }
+        refresh_token = jwt.encode(refresh_payload, JWT_SECRET, algorithm='HS256')
+    
+        # Store refresh token (keyed by jti for easy revocation)
+        with refresh_tokens_lock:
+            refresh_tokens[raw_refresh] = {
+                'user_id':  user_id,
+                'exp':      current_time + REFRESH_TOKEN_TTL,
+                'rt_str':   refresh_token,  # full encoded JWT (returned to client)
+            }
+    
+        session_id = create_session(user_id, user, access_token)
+    
+        return access_token, refresh_token, session_id
     def handle_user_verify(self, data):
         try:
             logger.info("="*60)
@@ -1273,32 +1325,24 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send_response({'error': 'OTP does not match user'}, 401)
                 return
 
+            # PASTE this inside handle_user_verify instead of the old block:
+            # VERIFY_REPLACEMENT = """
             current_time = int(time.time())
-            payload = {
-                'user_id': user_id,
-                'phone': user.get('phone'),
-                'email': user.get('email'),
-                'name': user.get('name'),
-                'iat': current_time,
-                'exp': current_time + 10800
-            }
-            logger.info(f"Generating JWT token with payload: {json.dumps(payload, indent=2)}")
-            
-            token = jwt.encode(payload, JWT_SECRET, algorithm='HS256')
-            logger.info(f"JWT token generated (first 20 chars): {token[:20]}...")
-            
-            session_id = create_session(user_id, user, token)
-            logger.info(f"Session created: session_id={session_id}")
-            
+            access_token, refresh_token, session_id = self._generate_tokens_for_user(user_id, user)
+
+            logger.info(f"✅ VERIFY SUCCESS: User {user_id} authenticated, "
+                        f"access exp=24h, refresh exp=7d")
+
             response_data = {
-                'success': True,
-                'token': token,
-                'session_id': session_id,
-                'user_id': user_id,
-                'data': user,
-                'expires_in': 10800
-            }
-            
+                'success':       True,
+                'token':         access_token,      # backward-compat key
+                'access_token':  access_token,
+                'refresh_token': refresh_token,
+                'session_id':    session_id,
+                'user_id':       user_id,
+                'data':          user,
+                'expires_in':    ACCESS_TOKEN_TTL,  # 86400
+            }            
             logger.info(f"✅ VERIFY SUCCESS: User {user_id} authenticated")
             logger.info("="*60)
             self._send_response(response_data, 200)
@@ -1654,6 +1698,99 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             logger.error(f"Update user by ID failed: {str(e)}", exc_info=True)
             self._send_response({'error': f'Update user by ID failed: {str(e)}'}, 500)
+    def handle_user_refresh(self, data):
+        """
+        POST /api/v1/user/refresh
+        Body: { "refresh_token": "<refresh JWT>" }
+        Returns new access_token + rotated refresh_token, or 401.
+        """
+        try:
+            rt_str = data.get('refresh_token', '')
+            if not rt_str:
+                self._send_response({'error': 'refresh_token is required'}, 400)
+                return
+
+            # ── Step 1: Decode and validate the refresh JWT signature + expiry ──
+            try:
+                decoded = jwt.decode(rt_str, JWT_SECRET, algorithms=['HS256'])
+            except jwt.ExpiredSignatureError:
+                logger.warning("🔄 REFRESH: Refresh token JWT expired")
+                self._send_response({'error': 'Refresh token expired', 'sessionExpired': True}, 401)
+                return
+            except jwt.InvalidTokenError as e:
+                logger.warning(f"🔄 REFRESH: Invalid refresh token — {e}")
+                self._send_response({'error': f'Invalid refresh token: {e}'}, 401)
+                return
+
+            if decoded.get('type') != 'refresh':
+                self._send_response({'error': 'Not a refresh token'}, 401)
+                return
+
+            # BUG FIX 1: use a different loop variable name so incoming_jti is never shadowed
+            incoming_jti = decoded.get('jti', '')
+            user_id      = decoded.get('user_id')
+
+            if not incoming_jti or not user_id:
+                self._send_response({'error': 'Malformed refresh token'}, 401)
+                return
+
+            current_ts = int(time.time())
+
+            # ── Step 2: Check the incoming JTI is in our store (BUG FIX 2) ──────
+            with refresh_tokens_lock:
+                stored = refresh_tokens.get(incoming_jti)
+
+                if not stored or stored['user_id'] != user_id:
+                    logger.warning(f"🔄 REFRESH: JTI {incoming_jti[:8]}… not in store or user mismatch — revoked or reused")
+                    self._send_response({'error': 'Refresh token revoked or unknown', 'sessionExpired': True}, 401)
+                    return
+
+                # Revoke the OLD refresh token immediately (one-time use / rotation)
+                del refresh_tokens[incoming_jti]
+
+                # Also clean up any other expired tokens while we hold the lock
+                expired_keys = [k for k, v in list(refresh_tokens.items()) if v['exp'] < current_ts]
+                for k in expired_keys:
+                    del refresh_tokens[k]
+                if expired_keys:
+                    logger.info(f"Cleaned up {len(expired_keys)} expired refresh token(s)")
+
+            # ── Step 3: Fetch fresh user data from Odoo (BUG FIX 3) ─────────────
+            # Use execute_odoo_kw_optimized directly — there is no self.get_user_by_id_from_odoo()
+            try:
+                user_ids = execute_odoo_kw_optimized(
+                    'res.partner', 'search',
+                    [[('id', '=', user_id), ('active', '=', True)]],
+                    cache_key=f"refresh_user_exists_{user_id}",
+                )
+                if not user_ids:
+                    self._send_response({'error': 'User not found or deactivated'}, 404)
+                    return
+                user = execute_odoo_kw_optimized(
+                    'res.partner', 'read',
+                    [user_id, ['name', 'phone', 'email']],
+                )[0]
+            except Exception as odoo_err:
+                logger.error(f"❌ REFRESH: Odoo lookup failed for user {user_id} — {odoo_err}", exc_info=True)
+                self._send_response({'error': 'Failed to fetch user data'}, 500)
+                return
+
+            # ── Step 4: Issue new rotated token pair ─────────────────────────────
+            new_access, new_refresh, session_id = self._generate_tokens_for_user(user_id, user)
+
+            logger.info(f"🔄 REFRESH SUCCESS: User {user_id} — new tokens issued (access={ACCESS_TOKEN_TTL}s, refresh={REFRESH_TOKEN_TTL}s)")
+            self._send_response({
+                'success':       True,
+                'access_token':  new_access,
+                'token':         new_access,    # backward-compat key
+                'refresh_token': new_refresh,
+                'session_id':    session_id,
+                'expires_in':    ACCESS_TOKEN_TTL,
+            }, 200)
+
+        except Exception as e:
+            logger.error(f"❌ REFRESH EXCEPTION: {e}", exc_info=True)
+            self._send_response({'error': f'Refresh failed: {str(e)}'}, 500)
 
     # FIX: Add log_message override to prevent broken pipe errors from flooding logs
     def log_message(self, format, *args):
