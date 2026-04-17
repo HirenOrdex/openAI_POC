@@ -204,7 +204,7 @@ refresh_tokens: dict = {}           # { refresh_token_str: { user_id, exp } }
 refresh_tokens_lock = threading.RLock()
  
 ACCESS_TOKEN_TTL  = 24 * 60 * 60   # 24 hours  (seconds)
-REFRESH_TOKEN_TTL = 7  * 24 * 60 * 60  # 7 days (seconds)
+REFRESH_TOKEN_TTL = 365 * 24 * 60 * 60  # 365 days (seconds)
 
 # --- Database-Level OTP Management using res.partner ---
 OTP_TTL_SECONDS = 300  # 5 minutes
