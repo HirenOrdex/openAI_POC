@@ -889,6 +889,21 @@ def strip_html_tags(text):
     clean = re.sub('<.*?>', '', str(text))
     return clean.strip()
 
+# ── SSE globals for QR visit wait endpoint ───────────────────────────────────
+_visit_events: dict = {}          # visit_token -> threading.Event
+_visit_lock   = threading.Lock()
+_visit_results = {}   # visit_token → partner dict       ← ADD THIS
+
+VISIT_SSE_TIMEOUT   = 300         # 5 min — how long to hold the SSE connection
+VISIT_SSE_HEARTBEAT = 20          # send a heartbeat comment every 20 s
+
+def _sse_write(handler, data: dict):
+    """Write one SSE data frame and flush."""
+    payload = f"data: {json.dumps(data)}\n\n".encode()
+    handler.wfile.write(payload)
+    handler.wfile.flush()
+# ─────────────────────────────────────────────────────────────────────────────
+
 class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
 
     def _send_response(self, data, status=200):
@@ -980,6 +995,11 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             elif self.path.startswith('/api/v1/user/') and self.path.count('/') == 4 and self.command == 'GET':
                 user_id = self.path.split('/')[-1]
                 self.handle_get_user_by_id(user_id)
+            # ✅ NEW SSE ROUTE (place BEFORE else)
+            elif re.match(r'^/api/v1/wait-visit/([^/?]+)', self.path):
+                token = re.match(r'^/api/v1/wait-visit/([^/?]+)', self.path).group(1)
+                self.handle_wait_visit(token)
+                return
             else:
                 logger.warning(f"404 Not Found for path: {self.path}")
                 self._send_response({'error': 'Not Found'}, 404)
@@ -1122,6 +1142,8 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 self.handle_user_refresh(data)
             elif self.path == '/api/v1/store-visit':
                 self.handle_store_visit(data)
+            elif self.path == '/api/v1/internal/activate-visit':
+                self.handle_internal_activate_visit(data)
             elif self.path.startswith('/api/v1/user/') and len(self.path.split('/')) == 5:
                 user_id = self.path.split('/')[-1]
                 self.handle_update_user_by_id(data, user_id)
@@ -1381,7 +1403,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             else:
                 otp = _generate_otp(6)
             logger.info(f"Generated OTP: {otp} for user_id={user_id}")
-            
+            print(f"Generated OTP for user_id={user_id}: {otp}")  # Also print to console for easy testing
             logger.info(f"Storing OTP in database/storage...")
             _put_otp(sanitized, otp, user_id)
             logger.info(f"OTP stored successfully")
@@ -1561,15 +1583,95 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             self._send_response({'error': f'Verification failed: {str(e)}'}, 500)
 
 
+
+
+
+    # ── handle_wait_visit — full replacement ─────────────────────────────────
+    def handle_wait_visit(self, visit_token):
+        evt = threading.Event()
+
+        with _visit_lock:
+            already_activated = visit_token in _visit_results
+            if not already_activated:
+                _visit_events[visit_token] = evt   # register only if not yet done
+
+        # Send SSE headers regardless — connection must be established first
+        self.send_response(200)
+        self.send_header("Content-Type",  "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection",    "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        if already_activated:
+            # Token was activated before SSE opened — fire immediately, don't wait
+            with _visit_lock:
+                partner_data = _visit_results.pop(visit_token, {})
+            try:
+                _sse_write(self, {"activated": True, "visit_token": visit_token, **partner_data})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        try:
+            deadline = time.monotonic() + VISIT_SSE_TIMEOUT
+
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    try:
+                        _sse_write(self, {"timeout": True, "visit_token": visit_token})
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    break
+
+                wait_secs = min(VISIT_SSE_HEARTBEAT, remaining)
+                activated = evt.wait(timeout=wait_secs)
+
+                if activated:
+                    with _visit_lock:
+                        partner_data = _visit_results.pop(visit_token, {})
+                    _sse_write(self, {
+                        "activated":   True,
+                        "visit_token": visit_token,
+                        **partner_data,
+                    })
+                    break
+                else:
+                    try:
+                        self.wfile.write(b": heartbeat\n\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+        finally:
+            with _visit_lock:
+                _visit_events.pop(visit_token, None)
+
+
     def handle_store_visit(self, data):
+        """
+        POST /api/v1/store-visit
+
+        Two modes depending on whether the mobile app sends a visit_token:
+
+        MODE A — visit_token present (normal QR scan flow):
+            The POS screen already created a pending store.visit with that token.
+            We call store.visit.activate_visit(token, partner_id) via XML-RPC.
+            Odoo sets qr_state = "open".
+            The POS JS, which is polling validate_qr_token every 2 s, will now
+            get a truthy result and unlock the ProductScreen.
+
+        MODE B — no visit_token (legacy / direct check-in):
+            Create a new store.visit record the old way.
+        """
         try:
             auth_header = self.headers.get('Authorization')
             if not auth_header or not auth_header.startswith('Bearer '):
                 self._send_response({'error': 'Authorization header missing or invalid'}, 401)
                 return
-            
+
             token = auth_header.split(' ')[1]
-            
+
             try:
                 decoded_token = validate_token_and_session(token)
             except jwt.ExpiredSignatureError:
@@ -1580,37 +1682,150 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 logger.warning("Invalid JWT token received")
                 self._send_response({'error': 'Invalid token'}, 401)
                 return
-            
-            user_id = decoded_token['user_id']
-            user_data = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['name', 'phone', 'email']])[0]
-            
+
+            user_id   = decoded_token['user_id']
+            user_data = execute_odoo_kw_optimized(
+                'res.partner', 'read', [user_id, ['name', 'phone', 'email']]
+            )[0]
+
+            visit_token = data.get('visit_token')
+
+            # ── MODE A: activate an existing pending visit via QR token ──────
+            if visit_token:
+                logger.info(
+                    f"Store visit activation requested: "
+                    f"token={visit_token} user_id={user_id}"
+                )
+                activated = execute_odoo_kw_optimized('store.visit', 'activate_visit',[visit_token, int(user_id)],)
+ 
+                if not activated:
+                    logger.warning(f"activate_visit returned False for token={visit_token}")
+                    self._send_response({
+                        'error': 'Visit token not found, already used, or expired.'
+                    }, 404)
+                    return
+
+                partner_data = activated if isinstance(activated, dict) else {}
+                with _visit_lock:
+                    _visit_results[visit_token] = partner_data   # store FIRST
+                    evt = _visit_events.get(visit_token)
+                if evt:
+                    evt.set()
+                    logger.info(f"SSE fired via internal endpoint: token={visit_token}")
+                else:
+                    logger.info(f"No SSE yet for token={visit_token} — stored for early pickup")
+                # ↑↑↑ TO HERE ↑↑↑
+
+                self._send_response({
+                    'success':     True,
+                    'message':     'Visit activated — POS will unlock shortly',
+                    'visit_token': visit_token,
+                    'partner_id':  partner_id,
+                }, 200)
+            # ── MODE B: legacy direct check-in (no QR token) ─────────────────
             visit_data = {
-                'name': data.get('name', user_data.get('name', 'Anonymous Visit')),
-                'phone': data.get('phone', user_data.get('phone', '')),
-                'email': data.get('email', user_data.get('email', '')),
-                'user_id': str(user_id),
+                'name':      data.get('name',  user_data.get('name',  'Anonymous Visit')),
+                'phone':     data.get('phone', user_data.get('phone', '')),
+                'email':     data.get('email', user_data.get('email', '')),
+                'user_id':   str(user_id),
                 'last_name': data.get('last_name', ''),
-                'mobile': data.get('mobile', data.get('phone', user_data.get('phone', ''))),
-                'entered': True,
+                'mobile':    data.get('mobile', data.get('phone', user_data.get('phone', ''))),
+                'entered':   True,
             }
-            
             if data.get('warehouse_id'):
                 visit_data['warehouse_id'] = data['warehouse_id']
-            
+
             visit_id = execute_odoo_kw_optimized('store.visit', 'create', [visit_data])
-            created_visit = execute_odoo_kw_optimized('store.visit', 'read', [visit_id])[0]
-            
-            logger.info(f"Store visit created with ID: {visit_id} by user {user_id}")
+            logger.info(f"Store visit created (legacy mode): id={visit_id} user={user_id}")
             self._send_response({
-                'success': True, 
-                'message': 'Store visit created successfully', 
-                'visit_id': visit_id, 
-                'data': visit_data
+                'success':  True,
+                'message':  'Store visit created successfully',
+                'visit_id': visit_id,
+                'data':     visit_data,
             }, 201)
-            
+
         except Exception as e:
-            logger.error(f"Store visit creation failed: {str(e)}", exc_info=True)
-            self._send_response({'error': f'Store visit creation failed: {str(e)}'}, 500)
+            logger.error(f"Store visit failed: {str(e)}", exc_info=True)
+            self._send_response({'error': f'Store visit failed: {str(e)}'}, 500)
+    def handle_internal_activate_visit(self, data):
+        """
+        POST /api/v1/internal/activate-visit
+ 
+        Called by the Node.js QR server on behalf of the mobile app.
+        Bypasses user JWT/session — authenticated by X-Service-Key header only.
+ 
+        Body: { "visit_token": "...", "partner_id": 123 }
+ 
+        Calls store.visit.activate_visit() via XML-RPC then fires the SSE event
+        so the waiting POS screen unlocks immediately.
+        """
+        try:
+            service_key = self.headers.get('X-Service-Key', '')
+            print(f"Internal activate-visit called with service key: {service_key}")
+            print(f"Expected service key: {JWT_SECRET}")
+            if service_key != JWT_SECRET:
+                logger.warning(f"Internal endpoint called with wrong service key")
+                self._send_response({'error': 'Forbidden'}, 403)
+                return
+ 
+            visit_token = data.get('visit_token')
+            partner_id  = data.get('partner_id')
+ 
+            if not visit_token or not partner_id:
+                self._send_response({'error': 'Missing visit_token or partner_id'}, 400)
+                return
+ 
+            logger.info(f"Internal activate-visit: token={visit_token} partner_id={partner_id}")
+ 
+            # activated = execute_odoo_kw_optimized(
+            #     'store.visit', 'activate_visit',
+            #     [visit_token, int(partner_id)],
+            # )
+ 
+            # if not activated:
+            #     logger.warning(f"activate_visit returned False for token={visit_token}")
+            #     self._send_response({
+            #         'error': 'Visit token not found, already used, or expired.'
+            #     }, 404)
+            #     return
+ 
+            # # Fire SSE — unblocks the waiting POS screen immediately
+            # with _visit_lock:
+            #     evt = _visit_events.get(visit_token)
+            # if evt:
+            #     evt.set()
+ 
+            activated = execute_odoo_kw_optimized(
+                'store.visit', 'activate_visit',
+                [visit_token, int(partner_id)],
+            )
+ 
+            if not activated:
+                logger.warning(f"activate_visit returned False for token={visit_token}")
+                self._send_response({
+                    'error': 'Visit token not found, already used, or expired.'
+                }, 404)
+                return
+            partner_data = activated if isinstance(activated, dict) else {}
+            with _visit_lock:
+                _visit_results[visit_token] = partner_data   # store FIRST
+                evt = _visit_events.get(visit_token)
+            if evt:
+                evt.set()
+                logger.info(f"SSE fired for token={visit_token}")
+            else:
+                logger.info(f"No SSE yet for token={visit_token} — stored for early pickup")
+ 
+            self._send_response({
+                'success':     True,
+                'message':     'Visit activated — POS will unlock shortly',
+                'visit_token': visit_token,
+                'partner_id':  partner_id,
+            }, 200)
+ 
+        except Exception as e:
+            logger.error(f"handle_internal_activate_visit failed: {e}", exc_info=True)
+            self._send_response({'error': f'Internal error: {str(e)}'}, 500)
 
     def handle_get_user_details(self):
         """GET /api/v1/user/details - Get authenticated user's details."""
@@ -1635,7 +1850,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             
             user_id = decoded_token['user_id']
             user_data = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['name', 'phone', 'email', 'last_name', 'vat', 'ref']])[0]
-            
+            # print(user_data)
             api_user_data = {
                 'id': user_data['id'],
                 'name': user_data['name'],
@@ -2065,6 +2280,7 @@ def run(server_class=http.server.HTTPServer, handler_class=EnhancedApiHandler, p
         logger.info("   5. GET /api/v1/user/sessions - Get active sessions")
         logger.info("   6. DELETE /api/v1/user/{user_id} - Soft delete user")
         logger.info("   7. GET /api/v1/user/list - Get user list")
+        logger.info("   8. POST /api/v1/store-visit - QR activate (visit_token) or legacy create")
 
         print("=" * 70)
         print("OPTIMIZED ENHANCED STORE API SERVER STARTING...")
@@ -2080,7 +2296,8 @@ def run(server_class=http.server.HTTPServer, handler_class=EnhancedApiHandler, p
         print("   - 019SMS OTP integration with dynamic codes")
         print("   - Thread-safe operations")
         print("   - Fixed mutable defaults bug")
-        print("7 NEW ENDPOINTS READY!")
+        print("8 ENDPOINTS READY!")
+        print("QR GATE: POST /api/v1/store-visit with visit_token → activates via Odoo XML-RPC")
         print("=" * 70)
 
         httpd.serve_forever()
