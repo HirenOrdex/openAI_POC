@@ -14,6 +14,8 @@ import os
 import re
 import threading
 from functools import lru_cache
+import socket
+socket.setdefaulttimeout(15)  # 15s timeout on all XML-RPC calls
 
 # --- Load Configuration ---
 config = configparser.ConfigParser()
@@ -890,10 +892,9 @@ def strip_html_tags(text):
     return clean.strip()
 
 # ── SSE globals for QR visit wait endpoint ───────────────────────────────────
-_visit_events: dict = {}          # visit_token -> threading.Event
-_visit_lock   = threading.Lock()
-_visit_results = {}   # visit_token → partner dict       ← ADD THIS
-
+_visit_events:  dict = {}          # visit_token -> threading.Event
+_visit_results: dict = {}          # visit_token -> partner_data (early pickup)
+_visit_lock    = threading.Lock()
 VISIT_SSE_TIMEOUT   = 300         # 5 min — how long to hold the SSE connection
 VISIT_SSE_HEARTBEAT = 20          # send a heartbeat comment every 20 s
 
@@ -1584,36 +1585,23 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
 
 
 
-
-
-    # ── handle_wait_visit — full replacement ─────────────────────────────────
     def handle_wait_visit(self, visit_token):
+        """
+        GET /api/v1/wait-visit/<visit_token>
+        SSE endpoint — holds connection open until mobile scans QR or timeout.
+        """
         evt = threading.Event()
-
         with _visit_lock:
-            already_activated = visit_token in _visit_results
-            if not already_activated:
-                _visit_events[visit_token] = evt   # register only if not yet done
-
-        # Send SSE headers regardless — connection must be established first
-        self.send_response(200)
-        self.send_header("Content-Type",  "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection",    "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        if already_activated:
-            # Token was activated before SSE opened — fire immediately, don't wait
-            with _visit_lock:
-                partner_data = _visit_results.pop(visit_token, {})
-            try:
-                _sse_write(self, {"activated": True, "visit_token": visit_token, **partner_data})
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            return
+            _visit_events[visit_token] = evt
 
         try:
+            self.send_response(200)
+            self.send_header("Content-Type",  "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection",    "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
             deadline = time.monotonic() + VISIT_SSE_TIMEOUT
 
             while True:
@@ -1622,7 +1610,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                     try:
                         _sse_write(self, {"timeout": True, "visit_token": visit_token})
                     except (BrokenPipeError, ConnectionResetError):
-                        pass
+                        pass  # browser already disconnected — normal
                     break
 
                 wait_secs = min(VISIT_SSE_HEARTBEAT, remaining)
@@ -1631,11 +1619,10 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 if activated:
                     with _visit_lock:
                         partner_data = _visit_results.pop(visit_token, {})
-                    _sse_write(self, {
-                        "activated":   True,
-                        "visit_token": visit_token,
-                        **partner_data,
-                    })
+                    try:
+                        _sse_write(self, {"activated": True, "visit_token": visit_token, **partner_data})
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
                     break
                 else:
                     try:
@@ -1643,26 +1630,107 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError):
                         break
+
         finally:
             with _visit_lock:
                 _visit_events.pop(visit_token, None)
+
+    def handle_internal_activate_visit(self, data):
+        """
+        POST /api/v1/internal/activate-visit
+        Auth: X-Service-Key == JWT_SECRET
+        Body: { "visit_token": "...", "partner_id": 123 }
+        """
+        try:
+            service_key = self.headers.get('X-Service-Key', '')
+            if service_key != JWT_SECRET:
+                logger.warning("Internal endpoint: wrong service key")
+                self._send_response({'error': 'Forbidden'}, 403)
+                return
+
+            visit_token = data.get('visit_token')
+            partner_id  = data.get('partner_id')
+            if not visit_token or not partner_id:
+                logger.warning(f"Missing fields: visit_token={visit_token} partner_id={partner_id}")
+                self._send_response({'error': 'Missing visit_token or partner_id'}, 400)
+                return
+
+            print(f"[STEP 1] token={visit_token} partner_id={partner_id}", flush=True)
+            logger.info(f"Internal activate-visit: token={visit_token} partner_id={partner_id}")
+
+            # ── STEP 2: activate via tl_pos_store_visit's activate_visit ─────────
+            # This writes qr_state='open' (valid in tl_pos_store_visit's selection).
+            # DO NOT use mark_scanned — it writes qr_state='scanned' which does NOT
+            # exist in tl_pos_store_visit's redefined qr_state field → ValueError.
+            print(f"[STEP 2] Calling activate_visit...", flush=True)
+            activated = execute_odoo_kw_optimized(
+                'store.visit', 'activate_visit',
+                [visit_token, int(partner_id)],
+            )
+            print(f"[STEP 2 result] activated={activated}", flush=True)
+
+            if not activated:
+                logger.warning(f"activate_visit returned False for token={visit_token}")
+                self._send_response({
+                    'error': 'Visit token not found, already used, or expired.'
+                }, 404)
+                return
+
+            # activate_visit returns a dict: {visit_id, partner_id, partner_name, first_name, lang}
+            # Fall back to a basic dict if old Odoo model returns True instead of dict
+            if isinstance(activated, dict):
+                partner_data = activated
+            else:
+                # Old model — fetch partner info manually as fallback
+                print(f"[STEP 2b] activate_visit returned True (old model) — reading partner", flush=True)
+                try:
+                    partner_info = execute_odoo_kw_optimized(
+                        'res.partner', 'read',
+                        [int(partner_id), ['name', 'phone', 'mobile', 'email', 'lang']],
+                    )[0]
+                except Exception as e:
+                    logger.warning(f"Could not read partner {partner_id}: {e}")
+                    partner_info = {}
+                partner_data = {
+                    'partner_id':   int(partner_id),
+                    'partner_name': partner_info.get('name', ''),
+                    'first_name':   (partner_info.get('name') or '').split()[0],
+                    'lang':         partner_info.get('lang', 'en_US'),
+                }
+
+            # ── STEP 3: store result FIRST, then fire SSE ────────────────────────
+            # Storing first handles the race where POS SSE opens AFTER activation.
+            # handle_wait_visit checks _visit_results on open and fires immediately.
+            print(f"[STEP 3] Storing result and firing SSE...", flush=True)
+            with _visit_lock:
+                _visit_results[visit_token] = partner_data
+                evt = _visit_events.get(visit_token)
+            if evt:
+                evt.set()
+                print(f"[STEP 3 OK] SSE fired for token={visit_token}", flush=True)
+                logger.info(f"SSE fired for token={visit_token}")
+            else:
+                print(f"[STEP 3] No SSE waiting — stored for early pickup: token={visit_token}", flush=True)
+                logger.info(f"No SSE yet — stored for early pickup: token={visit_token}")
+
+            self._send_response({
+                'success':     True,
+                'message':     'Visit activated — POS will unlock shortly',
+                'visit_token': visit_token,
+                **partner_data,
+            }, 200)
+
+        except Exception as e:
+            logger.error(f"handle_internal_activate_visit failed: {e}", exc_info=True)
+            self._send_response({'error': f'Internal error: {str(e)}'}, 500)
 
 
     def handle_store_visit(self, data):
         """
         POST /api/v1/store-visit
 
-        Two modes depending on whether the mobile app sends a visit_token:
-
-        MODE A — visit_token present (normal QR scan flow):
-            The POS screen already created a pending store.visit with that token.
-            We call store.visit.activate_visit(token, partner_id) via XML-RPC.
-            Odoo sets qr_state = "open".
-            The POS JS, which is polling validate_qr_token every 2 s, will now
-            get a truthy result and unlock the ProductScreen.
-
-        MODE B — no visit_token (legacy / direct check-in):
-            Create a new store.visit record the old way.
+        MODE A — visit_token present (normal QR scan flow)
+        MODE B — no visit_token (legacy / direct check-in)
         """
         try:
             auth_header = self.headers.get('Authorization')
@@ -1683,21 +1751,20 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send_response({'error': 'Invalid token'}, 401)
                 return
 
-            user_id   = decoded_token['user_id']
-            user_data = execute_odoo_kw_optimized(
-                'res.partner', 'read', [user_id, ['name', 'phone', 'email']]
-            )[0]
-
+            user_id     = decoded_token['user_id']
             visit_token = data.get('visit_token')
 
-            # ── MODE A: activate an existing pending visit via QR token ──────
+            # ── MODE A: QR scan ───────────────────────────────────────────────────
             if visit_token:
-                logger.info(
-                    f"Store visit activation requested: "
-                    f"token={visit_token} user_id={user_id}"
+                logger.info(f"Store visit activation: token={visit_token} user_id={user_id}")
+
+                # DO NOT use mark_scanned — writes qr_state='scanned' which crashes.
+                # Use activate_visit — writes qr_state='open' which is valid.
+                activated = execute_odoo_kw_optimized(
+                    'store.visit', 'activate_visit',
+                    [visit_token, int(user_id)],
                 )
-                activated = execute_odoo_kw_optimized('store.visit', 'activate_visit',[visit_token, int(user_id)],)
- 
+
                 if not activated:
                     logger.warning(f"activate_visit returned False for token={visit_token}")
                     self._send_response({
@@ -1705,24 +1772,47 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                     }, 404)
                     return
 
-                partner_data = activated if isinstance(activated, dict) else {}
+                if isinstance(activated, dict):
+                    partner_data = activated
+                else:
+                    # Old model fallback
+                    try:
+                        user_data = execute_odoo_kw_optimized(
+                            'res.partner', 'read',
+                            [int(user_id), ['name', 'phone', 'email', 'lang']],
+                        )[0]
+                    except Exception:
+                        user_data = {}
+                    partner_data = {
+                        'partner_id':   int(user_id),
+                        'partner_name': user_data.get('name', ''),
+                        'first_name':   (user_data.get('name') or '').split()[0],
+                        'lang':         user_data.get('lang', 'en_US'),
+                    }
+
+                # Store FIRST then fire — handles race where SSE opens after scan
                 with _visit_lock:
-                    _visit_results[visit_token] = partner_data   # store FIRST
+                    _visit_results[visit_token] = partner_data
                     evt = _visit_events.get(visit_token)
                 if evt:
                     evt.set()
-                    logger.info(f"SSE fired via internal endpoint: token={visit_token}")
+                    logger.info(f"SSE fired for token={visit_token}")
                 else:
-                    logger.info(f"No SSE yet for token={visit_token} — stored for early pickup")
-                # ↑↑↑ TO HERE ↑↑↑
+                    logger.info(f"No SSE yet — stored for early pickup: token={visit_token}")
 
                 self._send_response({
                     'success':     True,
                     'message':     'Visit activated — POS will unlock shortly',
                     'visit_token': visit_token,
-                    'partner_id':  partner_id,
+                    **partner_data,
                 }, 200)
-            # ── MODE B: legacy direct check-in (no QR token) ─────────────────
+                return
+
+            # ── MODE B: legacy direct check-in — only read partner here ──────────
+            user_data = execute_odoo_kw_optimized(
+                'res.partner', 'read', [int(user_id), ['name', 'phone', 'email']],
+            )[0]
+
             visit_data = {
                 'name':      data.get('name',  user_data.get('name',  'Anonymous Visit')),
                 'phone':     data.get('phone', user_data.get('phone', '')),
@@ -1747,509 +1837,430 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             logger.error(f"Store visit failed: {str(e)}", exc_info=True)
             self._send_response({'error': f'Store visit failed: {str(e)}'}, 500)
-    def handle_internal_activate_visit(self, data):
-        """
-        POST /api/v1/internal/activate-visit
- 
-        Called by the Node.js QR server on behalf of the mobile app.
-        Bypasses user JWT/session — authenticated by X-Service-Key header only.
- 
-        Body: { "visit_token": "...", "partner_id": 123 }
- 
-        Calls store.visit.activate_visit() via XML-RPC then fires the SSE event
-        so the waiting POS screen unlocks immediately.
-        """
-        try:
-            service_key = self.headers.get('X-Service-Key', '')
-            print(f"Internal activate-visit called with service key: {service_key}")
-            print(f"Expected service key: {JWT_SECRET}")
-            if service_key != JWT_SECRET:
-                logger.warning(f"Internal endpoint called with wrong service key")
-                self._send_response({'error': 'Forbidden'}, 403)
-                return
- 
-            visit_token = data.get('visit_token')
-            partner_id  = data.get('partner_id')
- 
-            if not visit_token or not partner_id:
-                self._send_response({'error': 'Missing visit_token or partner_id'}, 400)
-                return
- 
-            logger.info(f"Internal activate-visit: token={visit_token} partner_id={partner_id}")
- 
-            # activated = execute_odoo_kw_optimized(
-            #     'store.visit', 'activate_visit',
-            #     [visit_token, int(partner_id)],
-            # )
- 
-            # if not activated:
-            #     logger.warning(f"activate_visit returned False for token={visit_token}")
-            #     self._send_response({
-            #         'error': 'Visit token not found, already used, or expired.'
-            #     }, 404)
-            #     return
- 
-            # # Fire SSE — unblocks the waiting POS screen immediately
-            # with _visit_lock:
-            #     evt = _visit_events.get(visit_token)
-            # if evt:
-            #     evt.set()
- 
-            activated = execute_odoo_kw_optimized(
-                'store.visit', 'activate_visit',
-                [visit_token, int(partner_id)],
-            )
- 
-            if not activated:
-                logger.warning(f"activate_visit returned False for token={visit_token}")
+
+        def handle_get_user_details(self):
+            """GET /api/v1/user/details - Get authenticated user's details."""
+            try:
+                auth_header = self.headers.get('Authorization')
+                if not auth_header or not auth_header.startswith('Bearer '):
+                    self._send_response({'error': 'Authorization header missing or invalid'}, 401)
+                    return
+                
+                token = auth_header.split(' ')[1]
+                
+                try:
+                    decoded_token = validate_token_and_session(token)
+                except jwt.ExpiredSignatureError:
+                    logger.warning("Expired JWT token received")
+                    self._send_response({'error': 'Token has expired'}, 401)
+                    return
+                except jwt.InvalidTokenError:
+                    logger.warning("Invalid JWT token received")
+                    self._send_response({'error': 'Invalid token'}, 401)
+                    return
+                
+                user_id = decoded_token['user_id']
+                user_data = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['name', 'phone', 'email', 'last_name', 'vat', 'ref']])[0]
+                # print(user_data)
+                api_user_data = {
+                    'id': user_data['id'],
+                    'name': user_data['name'],
+                    'phone': user_data['phone'],
+                    'email': user_data['email'],
+                    'last_name': user_data.get('last_name', ''),
+                    'birthday': user_data.get('vat', ''),
+                    'identification_id': user_data.get('ref', '')
+                }
+                
+                session_info = {
+                    'user_id': user_id,
+                    'token_expires': decoded_token['exp'],
+                    'issued_at': decoded_token['iat']
+                }
+                
+                logger.info(f"User details retrieved for user ID: {user_id}")
                 self._send_response({
-                    'error': 'Visit token not found, already used, or expired.'
-                }, 404)
-                return
-            partner_data = activated if isinstance(activated, dict) else {}
-            with _visit_lock:
-                _visit_results[visit_token] = partner_data   # store FIRST
-                evt = _visit_events.get(visit_token)
-            if evt:
-                evt.set()
-                logger.info(f"SSE fired for token={visit_token}")
-            else:
-                logger.info(f"No SSE yet for token={visit_token} — stored for early pickup")
- 
-            self._send_response({
-                'success':     True,
-                'message':     'Visit activated — POS will unlock shortly',
-                'visit_token': visit_token,
-                'partner_id':  partner_id,
-            }, 200)
- 
-        except Exception as e:
-            logger.error(f"handle_internal_activate_visit failed: {e}", exc_info=True)
-            self._send_response({'error': f'Internal error: {str(e)}'}, 500)
-
-    def handle_get_user_details(self):
-        """GET /api/v1/user/details - Get authenticated user's details."""
-        try:
-            auth_header = self.headers.get('Authorization')
-            if not auth_header or not auth_header.startswith('Bearer '):
-                self._send_response({'error': 'Authorization header missing or invalid'}, 401)
-                return
-            
-            token = auth_header.split(' ')[1]
-            
-            try:
-                decoded_token = validate_token_and_session(token)
-            except jwt.ExpiredSignatureError:
-                logger.warning("Expired JWT token received")
-                self._send_response({'error': 'Token has expired'}, 401)
-                return
-            except jwt.InvalidTokenError:
-                logger.warning("Invalid JWT token received")
-                self._send_response({'error': 'Invalid token'}, 401)
-                return
-            
-            user_id = decoded_token['user_id']
-            user_data = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['name', 'phone', 'email', 'last_name', 'vat', 'ref']])[0]
-            # print(user_data)
-            api_user_data = {
-                'id': user_data['id'],
-                'name': user_data['name'],
-                'phone': user_data['phone'],
-                'email': user_data['email'],
-                'last_name': user_data.get('last_name', ''),
-                'birthday': user_data.get('vat', ''),
-                'identification_id': user_data.get('ref', '')
-            }
-            
-            session_info = {
-                'user_id': user_id,
-                'token_expires': decoded_token['exp'],
-                'issued_at': decoded_token['iat']
-            }
-            
-            logger.info(f"User details retrieved for user ID: {user_id}")
-            self._send_response({
-                'success': True,
-                'data': api_user_data,
-                'session_info': session_info
-            }, 200)
-            
-        except Exception as e:
-            logger.error(f"Get user details failed: {str(e)}", exc_info=True)
-            self._send_response({'error': f'Get user details failed: {str(e)}'}, 500)
-
-    def handle_user_update(self, data):
-        """POST /api/v1/user/update - Update authenticated user's details."""
-        try:
-            auth_header = self.headers.get('Authorization')
-            if not auth_header or not auth_header.startswith('Bearer '):
-                self._send_response({'error': 'Authorization header missing or invalid'}, 401)
-                return
-            
-            token = auth_header.split(' ')[1]
-            
-            try:
-                decoded_token = validate_token_and_session(token)
-            except jwt.ExpiredSignatureError:
-                logger.warning("Expired JWT token received")
-                self._send_response({'error': 'Token has expired'}, 401)
-                return
-            except jwt.InvalidTokenError:
-                logger.warning("Invalid JWT token received")
-                self._send_response({'error': 'Invalid token'}, 401)
-                return
-            
-            user_id = decoded_token['user_id']
-            
-            update_data = {}
-            if 'name' in data:
-                update_data['name'] = data['name']
-            if 'phone' in data:
-                existing_users = execute_odoo_kw_optimized('res.partner', 'search', [[('phone', '=', data['phone']), ('id', '!=', user_id)]])
-                if existing_users:
-                    self._send_response({'error': 'Phone number already in use by another user'}, 409)
-                    return
-                update_data['phone'] = data['phone']
-            if 'email' in data:
-                existing_users = execute_odoo_kw_optimized('res.partner', 'search', [[('email', '=', data['email']), ('id', '!=', user_id)]])
-                if existing_users:
-                    self._send_response({'error': 'Email already in use by another user'}, 409)
-                    return
-                update_data['email'] = data['email']
-            if 'last_name' in data:
-                update_data['last_name'] = data['last_name']
-            if 'birthday' in data:
-                update_data['vat'] = data['birthday']
-            if 'identification_id' in data:
-                update_data['ref'] = data['identification_id']
-            
-            if not update_data:
-                self._send_response({'error': 'No valid fields to update'}, 400)
-                return
-            
-            execute_odoo_kw_optimized('res.partner', 'write', [[user_id], update_data])
-            updated_user_data = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['name', 'phone', 'email', 'last_name', 'vat', 'ref']])[0]
-            
-            api_updated_data = {
-                'id': updated_user_data['id'],
-                'name': updated_user_data['name'],
-                'phone': updated_user_data['phone'],
-                'email': updated_user_data['email'],
-                'last_name': updated_user_data.get('last_name', ''),
-                'birthday': updated_user_data.get('vat', ''),
-                'identification_id': updated_user_data.get('ref', '')
-            }
-            
-            with active_sessions_lock:
-                for session_id, session_data in active_sessions.items():
-                    if session_data['token'] == token:
-                        session_data['user_data'] = api_updated_data
-                        break
-            
-            logger.info(f"User details updated for user ID: {user_id}")
-            self._send_response({
-                'success': True,
-                'message': 'User details updated successfully',
-                'data': api_updated_data
-            }, 200)
-            
-        except Exception as e:
-            logger.error(f"User update failed: {str(e)}", exc_info=True)
-            self._send_response({'error': f'User update failed: {str(e)}'}, 500)
-
-    def handle_user_logout(self, data):
-        """POST /api/v1/user/logout - Logout user and invalidate session."""
-        try:
-            auth_header = self.headers.get('Authorization')
-            if not auth_header or not auth_header.startswith('Bearer '):
-                self._send_response({'error': 'Authorization header missing or invalid'}, 401)
-                return
-            
-            token = auth_header.split(' ')[1]
-            
-            try:
-                decoded_token = validate_token_and_session(token)
-            except jwt.ExpiredSignatureError:
-                logger.warning("Expired JWT token received during logout")
-                self._send_response({'error': 'Token has expired'}, 401)
-                return
-            except jwt.InvalidTokenError:
-                logger.warning("Invalid JWT token received during logout")
-                self._send_response({'error': 'Invalid token'}, 401)
-                return
-            
-            user_id = decoded_token['user_id']
-            invalidate_session(token)
-
-            # Revoke refresh token from Odoo DB so it doesn't survive a restart
-            _revoke_refresh_token_db(user_id)
-            
-            logger.info(f"User logged out successfully: {user_id}")
-            self._send_response({
-                'success': True,
-                'message': 'Logged out successfully'
-            }, 200)
-            
-        except Exception as e:
-            logger.error(f"Logout failed: {str(e)}", exc_info=True)
-            self._send_response({'error': f'Logout failed: {str(e)}'}, 500)
-
-    def handle_get_active_sessions(self):
-        """GET /api/v1/user/sessions - Get active sessions."""
-        try:
-            auth_header = self.headers.get('Authorization')
-            if not auth_header or not auth_header.startswith('Bearer '):
-                self._send_response({'error': 'Authorization header missing or invalid'}, 401)
-                return
-            
-            token = auth_header.split(' ')[1]
-            
-            try:
-                decoded_token = validate_token_and_session(token)
-            except jwt.ExpiredSignatureError:
-                logger.warning("Expired JWT token received")
-                self._send_response({'error': 'Token has expired'}, 401)
-                return
-            except jwt.InvalidTokenError:
-                logger.warning("Invalid JWT token received")
-                self._send_response({'error': 'Invalid token'}, 401)
-                return
-            
-            cleanup_expired_sessions()
-            
-            sessions_info = []
-            with active_sessions_lock:
-                for session_id, session_data in active_sessions.items():
-                    sessions_info.append({
-                        'session_id': session_id,
-                        'user_id': session_data['user_id'],
-                        'user_name': session_data['user_data'].get('name', 'Unknown'),
-                        'created_at': session_data['created_at'].isoformat(),
-                        'last_activity': session_data['last_activity'].isoformat(),
-                        'is_current': session_data['token'] == token
-                    })
-            
-            with blacklisted_tokens_lock:
-                blacklist_count = len(blacklisted_tokens)
-            
-            logger.info(f"Active sessions retrieved by user: {decoded_token['user_id']}")
-            self._send_response({
-                'success': True,
-                'active_sessions_count': len(sessions_info),
-                'sessions': sessions_info,
-                'blacklisted_tokens_count': blacklist_count
-            }, 200)
-            
-        except Exception as e:
-            logger.error(f"Get active sessions failed: {str(e)}", exc_info=True)
-            self._send_response({'error': f'Get active sessions failed: {str(e)}'}, 500)
-
-    def handle_update_user_by_id(self, data, user_id):
-        """POST/PUT /api/v1/user/{user_id} - Update user details by their ID."""
-        try:
-            try:
-                user_id = int(user_id)
-            except ValueError:
-                self._send_response({'error': 'Invalid user ID format'}, 400)
-                return
-            
-            user_exists = execute_odoo_kw_optimized('res.partner', 'search', 
-                                                   [[('id', '=', user_id), ('active', '=', True)]], 
-                                                   cache_key=f"user_exists_{user_id}")
-            if not user_exists:
-                self._send_response({'error': 'User not found'}, 404)
-                return
-            
-            update_data = {}
-            
-            if 'name' in data:
-                update_data['name'] = data['name']
+                    'success': True,
+                    'data': api_user_data,
+                    'session_info': session_info
+                }, 200)
                 
-            if 'phone' in data:
-                existing_users = execute_odoo_kw_optimized('res.partner', 'search', 
-                                                [[('phone', '=', data['phone']), ('id', '!=', user_id)]])
-                if existing_users:
-                    self._send_response({'error': 'Phone number already in use by another user'}, 409)
-                    return
-                update_data['phone'] = data['phone']
-                
-            if 'email' in data:
-                existing_users = execute_odoo_kw_optimized('res.partner', 'search', 
-                                                [[('email', '=', data['email']), ('id', '!=', user_id)]])
-                if existing_users:
-                    self._send_response({'error': 'Email already in use by another user'}, 409)
-                    return
-                update_data['email'] = data['email']
-                
-            if 'last_name' in data:
-                update_data['last_name'] = data['last_name']
-                
-            if 'birthday' in data:
-                update_data['vat'] = data['birthday']
-                
-            if 'identification_id' in data:
-                update_data['ref'] = data['identification_id']
-            
-            if not update_data:
-                self._send_response({'error': 'No valid fields to update'}, 400)
-                return
-            
-            execute_odoo_kw_optimized('res.partner', 'write', [[user_id], update_data])
-            
-            updated_user_data = execute_odoo_kw_optimized('res.partner', 'read', 
-                                              [user_id, ['name', 'phone', 'email', 'last_name', 'vat', 'ref']])[0]
-            
-            api_updated_data = {
-                'id': updated_user_data['id'],
-                'name': updated_user_data['name'],
-                'phone': updated_user_data['phone'],
-                'email': updated_user_data['email'],
-                'last_name': updated_user_data.get('last_name', ''),
-                'birthday': updated_user_data.get('vat', ''),
-                'identification_id': updated_user_data.get('ref', '')
-            }
-            
-            # Clear cache
-            with cache_lock:
-                cache_key = f"user_exists_{user_id}"
-                cache_data.pop(cache_key, None)
-                cache_timestamps.pop(cache_key, None)
-            
-            logger.info(f"User {user_id} details updated successfully")
-            self._send_response({
-                'success': True,
-                'message': f'User {user_id} updated successfully',
-                'data': api_updated_data
-            }, 200)
-            
-        except Exception as e:
-            logger.error(f"Update user by ID failed: {str(e)}", exc_info=True)
-            self._send_response({'error': f'Update user by ID failed: {str(e)}'}, 500)
-    def handle_token_refresh(self, data):
-        """POST /api/v1/user/refresh - Silent token rotation backed by Odoo DB."""
-        try:
-            refresh_token = data.get('refresh_token')
-            if not refresh_token:
-                self._send_response({'error': 'refresh_token is required'}, 400)
-                return
+            except Exception as e:
+                logger.error(f"Get user details failed: {str(e)}", exc_info=True)
+                self._send_response({'error': f'Get user details failed: {str(e)}'}, 500)
 
-            # --- Decode JWT first (validates signature + expiry) ---
+        def handle_user_update(self, data):
+            """POST /api/v1/user/update - Update authenticated user's details."""
             try:
-                decoded = jwt.decode(refresh_token, JWT_SECRET, algorithms=['HS256'])
-            except jwt.ExpiredSignatureError:
-                self._send_response(
-                    {'error': 'Refresh token expired', 'sessionExpired': True}, 401
-                )
-                return
-            except jwt.InvalidTokenError:
-                self._send_response({'error': 'Invalid refresh token'}, 401)
-                return
-
-            if decoded.get('type') != 'refresh':
-                self._send_response({'error': 'Invalid token type'}, 401)
-                return
-
-            user_id  = decoded['user_id']
-            old_jti  = decoded.get('jti', '')
-
-            # --- Validate against Odoo DB (restart-safe) ---
-            # If the DB fields aren't installed yet, fall back to JWT-only validation
-            # (still safe — signature + expiry are verified by jwt.decode above).
-            if old_jti and _is_refresh_db_available():
-                ok, err = _validate_refresh_token_db(user_id, old_jti)
-                if not ok:
-                    logger.warning(f"Refresh rejected (DB) for user_id={user_id}: {err}")
-                    self._send_response(
-                        {'error': err, 'sessionExpired': True}, 401
-                    )
+                auth_header = self.headers.get('Authorization')
+                if not auth_header or not auth_header.startswith('Bearer '):
+                    self._send_response({'error': 'Authorization header missing or invalid'}, 401)
                     return
-                logger.info(f"Refresh token validated via DB for user_id={user_id}")
-            elif old_jti:
-                # DB not available — JWT signature already verified, proceed
-                logger.warning(
-                    f"DB refresh validation skipped (fields not installed) for user_id={user_id}. "
-                    "Upgrade hagrocery module to enable restart-safe token validation."
-                )
-            else:
-                # Legacy tokens (no jti) — accept once, will get jti on next refresh
-                logger.warning(
-                    f"Legacy refresh token (no jti) accepted for user_id={user_id}. "
-                    "Will be upgraded to DB-tracked token."
-                )
-
-            # --- Build new token pair ---
-            user = execute_odoo_kw_optimized(
-                'res.partner', 'read',
-                [user_id, ['name', 'phone', 'email']]
-            )[0]
-
-            current_time = int(time.time())
-            new_refresh_exp = current_time + (365 * 24 * 3600)  # 365 days
-            new_jti = secrets.token_hex(16)
-
-            new_access_payload = {
-                'user_id': user_id,
-                'phone':   user.get('phone'),
-                'email':   user.get('email'),
-                'name':    user.get('name'),
-                'iat':     current_time,
-                'exp':     current_time + 10800,        # 3 h
-                'type':    'access'
-            }
-            new_refresh_payload = {
-                'user_id': user_id,
-                'iat':     current_time,
-                'exp':     new_refresh_exp,             # 365 d
-                'type':    'refresh',
-                'jti':     new_jti,
-            }
-
-            new_access_token  = jwt.encode(new_access_payload,  JWT_SECRET, algorithm='HS256')
-            new_refresh_token = jwt.encode(new_refresh_payload, JWT_SECRET, algorithm='HS256')
-
-            # --- Atomically rotate JTI in Odoo DB (if fields available) ---
-            if _is_refresh_db_available():
-                if old_jti:
-                    rotated = _rotate_refresh_token_db(user_id, old_jti, new_jti, new_refresh_exp)
-                else:
-                    rotated = _store_refresh_token(user_id, new_jti, new_refresh_exp)
-
-                if not rotated:
-                    # Another request already rotated this token — reject to prevent replay
-                    self._send_response(
-                        {'error': 'Token already rotated, please retry', 'sessionExpired': True}, 401
-                    )
+                
+                token = auth_header.split(' ')[1]
+                
+                try:
+                    decoded_token = validate_token_and_session(token)
+                except jwt.ExpiredSignatureError:
+                    logger.warning("Expired JWT token received")
+                    self._send_response({'error': 'Token has expired'}, 401)
                     return
-            else:
-                # DB not available — skip rotation, new JWT is still valid on its own
-                logger.warning(f"DB rotation skipped for user_id={user_id} — JWT-only mode")
+                except jwt.InvalidTokenError:
+                    logger.warning("Invalid JWT token received")
+                    self._send_response({'error': 'Invalid token'}, 401)
+                    return
+                
+                user_id = decoded_token['user_id']
+                
+                update_data = {}
+                if 'name' in data:
+                    update_data['name'] = data['name']
+                if 'phone' in data:
+                    existing_users = execute_odoo_kw_optimized('res.partner', 'search', [[('phone', '=', data['phone']), ('id', '!=', user_id)]])
+                    if existing_users:
+                        self._send_response({'error': 'Phone number already in use by another user'}, 409)
+                        return
+                    update_data['phone'] = data['phone']
+                if 'email' in data:
+                    existing_users = execute_odoo_kw_optimized('res.partner', 'search', [[('email', '=', data['email']), ('id', '!=', user_id)]])
+                    if existing_users:
+                        self._send_response({'error': 'Email already in use by another user'}, 409)
+                        return
+                    update_data['email'] = data['email']
+                if 'last_name' in data:
+                    update_data['last_name'] = data['last_name']
+                if 'birthday' in data:
+                    update_data['vat'] = data['birthday']
+                if 'identification_id' in data:
+                    update_data['ref'] = data['identification_id']
+                
+                if not update_data:
+                    self._send_response({'error': 'No valid fields to update'}, 400)
+                    return
+                
+                execute_odoo_kw_optimized('res.partner', 'write', [[user_id], update_data])
+                updated_user_data = execute_odoo_kw_optimized('res.partner', 'read', [user_id, ['name', 'phone', 'email', 'last_name', 'vat', 'ref']])[0]
+                
+                api_updated_data = {
+                    'id': updated_user_data['id'],
+                    'name': updated_user_data['name'],
+                    'phone': updated_user_data['phone'],
+                    'email': updated_user_data['email'],
+                    'last_name': updated_user_data.get('last_name', ''),
+                    'birthday': updated_user_data.get('vat', ''),
+                    'identification_id': updated_user_data.get('ref', '')
+                }
+                
+                with active_sessions_lock:
+                    for session_id, session_data in active_sessions.items():
+                        if session_data['token'] == token:
+                            session_data['user_data'] = api_updated_data
+                            break
+                
+                logger.info(f"User details updated for user ID: {user_id}")
+                self._send_response({
+                    'success': True,
+                    'message': 'User details updated successfully',
+                    'data': api_updated_data
+                }, 200)
+                
+            except Exception as e:
+                logger.error(f"User update failed: {str(e)}", exc_info=True)
+                self._send_response({'error': f'User update failed: {str(e)}'}, 500)
 
-            # Keep in-memory blacklist as secondary guard (best effort, not required)
-            if old_jti:
+        def handle_user_logout(self, data):
+            """POST /api/v1/user/logout - Logout user and invalidate session."""
+            try:
+                auth_header = self.headers.get('Authorization')
+                if not auth_header or not auth_header.startswith('Bearer '):
+                    self._send_response({'error': 'Authorization header missing or invalid'}, 401)
+                    return
+                
+                token = auth_header.split(' ')[1]
+                
+                try:
+                    decoded_token = validate_token_and_session(token)
+                except jwt.ExpiredSignatureError:
+                    logger.warning("Expired JWT token received during logout")
+                    self._send_response({'error': 'Token has expired'}, 401)
+                    return
+                except jwt.InvalidTokenError:
+                    logger.warning("Invalid JWT token received during logout")
+                    self._send_response({'error': 'Invalid token'}, 401)
+                    return
+                
+                user_id = decoded_token['user_id']
+                invalidate_session(token)
+
+                # Revoke refresh token from Odoo DB so it doesn't survive a restart
+                _revoke_refresh_token_db(user_id)
+                
+                logger.info(f"User logged out successfully: {user_id}")
+                self._send_response({
+                    'success': True,
+                    'message': 'Logged out successfully'
+                }, 200)
+                
+            except Exception as e:
+                logger.error(f"Logout failed: {str(e)}", exc_info=True)
+                self._send_response({'error': f'Logout failed: {str(e)}'}, 500)
+
+        def handle_get_active_sessions(self):
+            """GET /api/v1/user/sessions - Get active sessions."""
+            try:
+                auth_header = self.headers.get('Authorization')
+                if not auth_header or not auth_header.startswith('Bearer '):
+                    self._send_response({'error': 'Authorization header missing or invalid'}, 401)
+                    return
+                
+                token = auth_header.split(' ')[1]
+                
+                try:
+                    decoded_token = validate_token_and_session(token)
+                except jwt.ExpiredSignatureError:
+                    logger.warning("Expired JWT token received")
+                    self._send_response({'error': 'Token has expired'}, 401)
+                    return
+                except jwt.InvalidTokenError:
+                    logger.warning("Invalid JWT token received")
+                    self._send_response({'error': 'Invalid token'}, 401)
+                    return
+                
+                cleanup_expired_sessions()
+                
+                sessions_info = []
+                with active_sessions_lock:
+                    for session_id, session_data in active_sessions.items():
+                        sessions_info.append({
+                            'session_id': session_id,
+                            'user_id': session_data['user_id'],
+                            'user_name': session_data['user_data'].get('name', 'Unknown'),
+                            'created_at': session_data['created_at'].isoformat(),
+                            'last_activity': session_data['last_activity'].isoformat(),
+                            'is_current': session_data['token'] == token
+                        })
+                
                 with blacklisted_tokens_lock:
-                    blacklisted_tokens.add(refresh_token)
+                    blacklist_count = len(blacklisted_tokens)
+                
+                logger.info(f"Active sessions retrieved by user: {decoded_token['user_id']}")
+                self._send_response({
+                    'success': True,
+                    'active_sessions_count': len(sessions_info),
+                    'sessions': sessions_info,
+                    'blacklisted_tokens_count': blacklist_count
+                }, 200)
+                
+            except Exception as e:
+                logger.error(f"Get active sessions failed: {str(e)}", exc_info=True)
+                self._send_response({'error': f'Get active sessions failed: {str(e)}'}, 500)
 
-            logger.info(f"Token rotated (DB) for user_id={user_id}")
-            self._send_response({
-                'success':       True,
-                'token':  new_access_token,
-                'access_token':  new_access_token,
-                'refresh_token': new_refresh_token,
-            }, 200)
+        def handle_update_user_by_id(self, data, user_id):
+            """POST/PUT /api/v1/user/{user_id} - Update user details by their ID."""
+            try:
+                try:
+                    user_id = int(user_id)
+                except ValueError:
+                    self._send_response({'error': 'Invalid user ID format'}, 400)
+                    return
+                
+                user_exists = execute_odoo_kw_optimized('res.partner', 'search', 
+                                                    [[('id', '=', user_id), ('active', '=', True)]], 
+                                                    cache_key=f"user_exists_{user_id}")
+                if not user_exists:
+                    self._send_response({'error': 'User not found'}, 404)
+                    return
+                
+                update_data = {}
+                
+                if 'name' in data:
+                    update_data['name'] = data['name']
+                    
+                if 'phone' in data:
+                    existing_users = execute_odoo_kw_optimized('res.partner', 'search', 
+                                                    [[('phone', '=', data['phone']), ('id', '!=', user_id)]])
+                    if existing_users:
+                        self._send_response({'error': 'Phone number already in use by another user'}, 409)
+                        return
+                    update_data['phone'] = data['phone']
+                    
+                if 'email' in data:
+                    existing_users = execute_odoo_kw_optimized('res.partner', 'search', 
+                                                    [[('email', '=', data['email']), ('id', '!=', user_id)]])
+                    if existing_users:
+                        self._send_response({'error': 'Email already in use by another user'}, 409)
+                        return
+                    update_data['email'] = data['email']
+                    
+                if 'last_name' in data:
+                    update_data['last_name'] = data['last_name']
+                    
+                if 'birthday' in data:
+                    update_data['vat'] = data['birthday']
+                    
+                if 'identification_id' in data:
+                    update_data['ref'] = data['identification_id']
+                
+                if not update_data:
+                    self._send_response({'error': 'No valid fields to update'}, 400)
+                    return
+                
+                execute_odoo_kw_optimized('res.partner', 'write', [[user_id], update_data])
+                
+                updated_user_data = execute_odoo_kw_optimized('res.partner', 'read', 
+                                                [user_id, ['name', 'phone', 'email', 'last_name', 'vat', 'ref']])[0]
+                
+                api_updated_data = {
+                    'id': updated_user_data['id'],
+                    'name': updated_user_data['name'],
+                    'phone': updated_user_data['phone'],
+                    'email': updated_user_data['email'],
+                    'last_name': updated_user_data.get('last_name', ''),
+                    'birthday': updated_user_data.get('vat', ''),
+                    'identification_id': updated_user_data.get('ref', '')
+                }
+                
+                # Clear cache
+                with cache_lock:
+                    cache_key = f"user_exists_{user_id}"
+                    cache_data.pop(cache_key, None)
+                    cache_timestamps.pop(cache_key, None)
+                
+                logger.info(f"User {user_id} details updated successfully")
+                self._send_response({
+                    'success': True,
+                    'message': f'User {user_id} updated successfully',
+                    'data': api_updated_data
+                }, 200)
+                
+            except Exception as e:
+                logger.error(f"Update user by ID failed: {str(e)}", exc_info=True)
+                self._send_response({'error': f'Update user by ID failed: {str(e)}'}, 500)
+        def handle_token_refresh(self, data):
+            """POST /api/v1/user/refresh - Silent token rotation backed by Odoo DB."""
+            try:
+                refresh_token = data.get('refresh_token')
+                if not refresh_token:
+                    self._send_response({'error': 'refresh_token is required'}, 400)
+                    return
 
-        except Exception as e:
-            logger.error(f"Token refresh failed: {str(e)}", exc_info=True)
-            self._send_response({'error': f'Token refresh failed: {str(e)}'}, 500)
+                # --- Decode JWT first (validates signature + expiry) ---
+                try:
+                    decoded = jwt.decode(refresh_token, JWT_SECRET, algorithms=['HS256'])
+                except jwt.ExpiredSignatureError:
+                    self._send_response(
+                        {'error': 'Refresh token expired', 'sessionExpired': True}, 401
+                    )
+                    return
+                except jwt.InvalidTokenError:
+                    self._send_response({'error': 'Invalid refresh token'}, 401)
+                    return
 
-    # Alias — do_POST calls handle_user_refresh, method was misnamed handle_token_refresh
-    handle_user_refresh = handle_token_refresh
+                if decoded.get('type') != 'refresh':
+                    self._send_response({'error': 'Invalid token type'}, 401)
+                    return
 
-    def log_message(self, format, *args):
-        """Override to add error handling for logging"""
-        try:
-            super().log_message(format, *args)
-        except Exception:
-            pass  # Silently ignore logging errors
+                user_id  = decoded['user_id']
+                old_jti  = decoded.get('jti', '')
+
+                # --- Validate against Odoo DB (restart-safe) ---
+                # If the DB fields aren't installed yet, fall back to JWT-only validation
+                # (still safe — signature + expiry are verified by jwt.decode above).
+                if old_jti and _is_refresh_db_available():
+                    ok, err = _validate_refresh_token_db(user_id, old_jti)
+                    if not ok:
+                        logger.warning(f"Refresh rejected (DB) for user_id={user_id}: {err}")
+                        self._send_response(
+                            {'error': err, 'sessionExpired': True}, 401
+                        )
+                        return
+                    logger.info(f"Refresh token validated via DB for user_id={user_id}")
+                elif old_jti:
+                    # DB not available — JWT signature already verified, proceed
+                    logger.warning(
+                        f"DB refresh validation skipped (fields not installed) for user_id={user_id}. "
+                        "Upgrade hagrocery module to enable restart-safe token validation."
+                    )
+                else:
+                    # Legacy tokens (no jti) — accept once, will get jti on next refresh
+                    logger.warning(
+                        f"Legacy refresh token (no jti) accepted for user_id={user_id}. "
+                        "Will be upgraded to DB-tracked token."
+                    )
+
+                # --- Build new token pair ---
+                user = execute_odoo_kw_optimized(
+                    'res.partner', 'read',
+                    [user_id, ['name', 'phone', 'email']]
+                )[0]
+
+                current_time = int(time.time())
+                new_refresh_exp = current_time + (365 * 24 * 3600)  # 365 days
+                new_jti = secrets.token_hex(16)
+
+                new_access_payload = {
+                    'user_id': user_id,
+                    'phone':   user.get('phone'),
+                    'email':   user.get('email'),
+                    'name':    user.get('name'),
+                    'iat':     current_time,
+                    'exp':     current_time + 10800,        # 3 h
+                    'type':    'access'
+                }
+                new_refresh_payload = {
+                    'user_id': user_id,
+                    'iat':     current_time,
+                    'exp':     new_refresh_exp,             # 365 d
+                    'type':    'refresh',
+                    'jti':     new_jti,
+                }
+
+                new_access_token  = jwt.encode(new_access_payload,  JWT_SECRET, algorithm='HS256')
+                new_refresh_token = jwt.encode(new_refresh_payload, JWT_SECRET, algorithm='HS256')
+
+                # --- Atomically rotate JTI in Odoo DB (if fields available) ---
+                if _is_refresh_db_available():
+                    if old_jti:
+                        rotated = _rotate_refresh_token_db(user_id, old_jti, new_jti, new_refresh_exp)
+                    else:
+                        rotated = _store_refresh_token(user_id, new_jti, new_refresh_exp)
+
+                    if not rotated:
+                        # Another request already rotated this token — reject to prevent replay
+                        self._send_response(
+                            {'error': 'Token already rotated, please retry', 'sessionExpired': True}, 401
+                        )
+                        return
+                else:
+                    # DB not available — skip rotation, new JWT is still valid on its own
+                    logger.warning(f"DB rotation skipped for user_id={user_id} — JWT-only mode")
+
+                # Keep in-memory blacklist as secondary guard (best effort, not required)
+                if old_jti:
+                    with blacklisted_tokens_lock:
+                        blacklisted_tokens.add(refresh_token)
+
+                logger.info(f"Token rotated (DB) for user_id={user_id}")
+                self._send_response({
+                    'success':       True,
+                    'token':  new_access_token,
+                    'access_token':  new_access_token,
+                    'refresh_token': new_refresh_token,
+                }, 200)
+
+            except Exception as e:
+                logger.error(f"Token refresh failed: {str(e)}", exc_info=True)
+                self._send_response({'error': f'Token refresh failed: {str(e)}'}, 500)
+
+        # Alias — do_POST calls handle_user_refresh, method was misnamed handle_token_refresh
+        handle_user_refresh = handle_token_refresh
+
+        def log_message(self, format, *args):
+            """Override to add error handling for logging"""
+            try:
+                super().log_message(format, *args)
+            except Exception:
+                pass  # Silently ignore logging errors
 
 def run(server_class=http.server.HTTPServer, handler_class=EnhancedApiHandler, port=8001):
     """Start server with error handling"""
