@@ -1593,6 +1593,10 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
         evt = threading.Event()
         with _visit_lock:
             _visit_events[visit_token] = evt
+            # Early-pickup: activate_visit may have run BEFORE the SSE opened.
+            # If so, the result is already in _visit_results — fire immediately.
+            if visit_token in _visit_results:
+                evt.set()
 
         try:
             self.send_response(200)
