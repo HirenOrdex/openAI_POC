@@ -895,7 +895,7 @@ def strip_html_tags(text):
 _visit_events:  dict = {}          # visit_token -> threading.Event
 _visit_results: dict = {}          # visit_token -> partner_data (early pickup)
 _visit_lock    = threading.Lock()
-VISIT_SSE_TIMEOUT   = 300         # 5 min — how long to hold the SSE connection
+VISIT_SSE_TIMEOUT   = 60 * 60 * 2          # 2 hours — how long to hold the SSE connection
 VISIT_SSE_HEARTBEAT = 20          # send a heartbeat comment every 20 s
 
 def _sse_write(handler, data: dict):
