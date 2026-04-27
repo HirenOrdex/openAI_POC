@@ -1662,6 +1662,24 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             # This writes qr_state='open' (valid in tl_pos_store_visit's selection).
             # DO NOT use mark_scanned — it writes qr_state='scanned' which does NOT
             # exist in tl_pos_store_visit's redefined qr_state field → ValueError.
+
+            # ── DEBUG: check what Odoo actually has for this token BEFORE calling ──
+            try:
+                debug_records = execute_odoo_kw_optimized(
+                    'store.visit', 'search_read',
+                    [[('visit_token', '=', visit_token)]],
+                    {'fields': ['id', 'visit_token', 'qr_state', 'partner_id', 'create_date'], 'limit': 5},
+                )
+                if debug_records:
+                    logger.info(f"[DEBUG] store.visit records for token: {debug_records}")
+                    print(f"[DEBUG] Found {len(debug_records)} record(s): {debug_records}", flush=True)
+                else:
+                    logger.warning(f"[DEBUG] NO store.visit record found for token={visit_token} — token was never created in Odoo, or field name differs")
+                    print(f"[DEBUG] NO record in store.visit for this token!", flush=True)
+            except Exception as dbg_e:
+                logger.warning(f"[DEBUG] Could not query store.visit: {dbg_e}")
+            # ── END DEBUG ──────────────────────────────────────────────────────────
+
             print(f"[STEP 2] Calling activate_visit...", flush=True)
             activated = execute_odoo_kw_optimized(
                 'store.visit', 'activate_visit',
