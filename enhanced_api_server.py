@@ -1,4 +1,5 @@
 import http.server
+import socketserver
 import json
 import xmlrpc.client
 import jwt
@@ -586,82 +587,6 @@ def _get_and_validate_otp(identifier: str, otp: str):
         return True, entry['user_id'], None
 
 
-# Main OTP functions with fallback support
-def _put_otp(identifier: str, otp: str, user_id: int):
-    """Store OTP - tries res.partner fields first, falls back to local storage"""
-    if _check_otp_fields_exist():
-        success = _store_otp_in_partner(user_id, otp)
-        if success:
-            return
-        logger.warning("Failed to store OTP in res.partner, falling back to local storage")
-    
-    # Fallback to local storage for development/testing
-    logger.warning("Using local OTP storage - add custom fields to res.partner for production!")
-    global otp_store, otp_lock
-    if 'otp_store' not in globals():
-        otp_store = {}
-        otp_lock = threading.RLock()
-    
-    with otp_lock:
-        otp_store[identifier] = {
-            'otp': otp,
-            'user_id': user_id,
-            'expires_at': time.time() + OTP_TTL_SECONDS,
-        }
-
-def _get_and_validate_otp(identifier: str, otp: str):
-    """Validate OTP - tries res.partner fields first, falls back to local storage"""
-    logger.info(f"OTP validation: Checking for identifier={identifier}, otp={otp}")
-    
-    if _check_otp_fields_exist():
-        try:
-            success, user_id, error = _validate_otp_from_partner(identifier, otp)
-            logger.info(f"Database OTP validation: success={success}, user_id={user_id}, error={error}")
-            
-            # If found in database and valid, return
-            if success:
-                logger.info("OTP validated successfully from database")
-                return True, user_id, None
-            
-            # If database said not found, try local storage
-            if error and ('not found' in error.lower() or 'expired' in error.lower()):
-                logger.warning(f"OTP not in database, trying local storage: {error}")
-            else:
-                # Other errors (invalid OTP, max attempts), return immediately
-                return False, user_id, error
-                
-        except Exception as e:
-            logger.error(f"Partner OTP validation exception: {str(e)}, trying local storage", exc_info=True)
-    
-    # Fallback to local storage for development/testing
-    logger.warning("Using local OTP validation - checking local storage")
-    global otp_store, otp_lock
-    if 'otp_store' not in globals():
-        logger.error("OTP local storage not initialized")
-        return False, None, 'OTP storage not initialized'
-    
-    logger.info(f"Local OTP store keys: {list(otp_store.keys()) if 'otp_store' in globals() else 'not initialized'}")
-    
-    with otp_lock:
-        entry = otp_store.get(identifier)
-        logger.info(f"Local storage lookup for '{identifier}': {entry}")
-        
-        if not entry:
-            logger.warning(f"OTP not found in local storage for identifier: {identifier}")
-            return False, None, 'OTP not found. Please request a new code.'
-        if time.time() > entry['expires_at']:
-            otp_store.pop(identifier, None)
-            logger.warning(f"OTP expired in local storage for identifier: {identifier}")
-            return False, None, 'OTP expired. Please request a new code.'
-        if str(entry['otp']) != str(otp):
-            logger.warning(f"OTP mismatch in local storage: expected={entry['otp']}, got={otp}")
-            return False, None, 'Invalid OTP'
-        # OTP valid, remove it (single-use)
-        otp_store.pop(identifier, None)
-        logger.info(f"✅ OTP validated successfully from local storage for user_id={entry['user_id']}")
-        return True, entry['user_id'], None
-
-
 def _get_sms_config():
     """Get SMS configuration from config file"""
     try:
@@ -894,9 +819,21 @@ def strip_html_tags(text):
 # ── SSE globals for QR visit wait endpoint ───────────────────────────────────
 _visit_events:  dict = {}          # visit_token -> threading.Event
 _visit_results: dict = {}          # visit_token -> partner_data (early pickup)
+_visit_result_ts: dict = {}        # visit_token -> timestamp (for cleanup)
 _visit_lock    = threading.Lock()
-VISIT_SSE_TIMEOUT   = 60 * 60 * 2          # 2 hours — how long to hold the SSE connection
-VISIT_SSE_HEARTBEAT = 20          # send a heartbeat comment every 20 s
+VISIT_SSE_TIMEOUT   = 5 * 60              # 5 min — match QR code TTL on POS side
+VISIT_SSE_HEARTBEAT = 20                  # heartbeat comment every 20 s
+VISIT_RESULT_MAX_AGE = 10 * 60           # drop orphaned results after 10 min
+
+def _cleanup_stale_visit_results():
+    """Remove _visit_results entries that were never consumed (SSE dropped before scan)."""
+    cutoff = time.monotonic() - VISIT_RESULT_MAX_AGE
+    with _visit_lock:
+        stale = [t for t, ts in _visit_result_ts.items() if ts < cutoff]
+        for token in stale:
+            _visit_results.pop(token, None)
+            _visit_result_ts.pop(token, None)
+            logger.debug(f"Cleaned up stale visit result for token={token[:8]}…")
 
 def _sse_write(handler, data: dict):
     """Write one SSE data frame and flush."""
@@ -1591,6 +1528,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
         SSE endpoint — holds connection open until mobile scans QR or timeout.
         """
         evt = threading.Event()
+        _cleanup_stale_visit_results()   # evict orphaned results on each new SSE open
         with _visit_lock:
             _visit_events[visit_token] = evt
             # Early-pickup: activate_visit may have run BEFORE the SSE opened.
@@ -1623,6 +1561,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 if activated:
                     with _visit_lock:
                         partner_data = _visit_results.pop(visit_token, {})
+                        _visit_result_ts.pop(visit_token, None)
                     try:
                         _sse_write(self, {"activated": True, "visit_token": visit_token, **partner_data})
                     except (BrokenPipeError, ConnectionResetError):
@@ -1713,7 +1652,18 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 except Exception as e:
                     logger.warning(f"Could not read partner {partner_id}: {e}")
                     partner_info = {}
+                # Fetch the visit_id we just activated by looking it up
+                try:
+                    visit_rows = execute_odoo_kw_optimized(
+                        'store.visit', 'search_read',
+                        [[('visit_token', '=', visit_token)]],
+                        {'fields': ['id'], 'limit': 1},
+                    )
+                    resolved_visit_id = visit_rows[0]['id'] if visit_rows else False
+                except Exception:
+                    resolved_visit_id = False
                 partner_data = {
+                    'visit_id':     resolved_visit_id,
                     'partner_id':   int(partner_id),
                     'partner_name': partner_info.get('name', ''),
                     'first_name':   (partner_info.get('name') or '').split()[0],
@@ -1726,6 +1676,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             print(f"[STEP 3] Storing result and firing SSE...", flush=True)
             with _visit_lock:
                 _visit_results[visit_token] = partner_data
+                _visit_result_ts[visit_token] = time.monotonic()
                 evt = _visit_events.get(visit_token)
             if evt:
                 evt.set()
@@ -1815,6 +1766,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 # Store FIRST then fire — handles race where SSE opens after scan
                 with _visit_lock:
                     _visit_results[visit_token] = partner_data
+                    _visit_result_ts[visit_token] = time.monotonic()
                     evt = _visit_events.get(visit_token)
                 if evt:
                     evt.set()
@@ -2284,7 +2236,19 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass  # Silently ignore logging errors
 
-def run(server_class=http.server.HTTPServer, handler_class=EnhancedApiHandler, port=8001):
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """Each request is handled in its own thread.
+
+    This is the critical fix that prevents SSE wait-visit connections from
+    blocking all other requests (activate-visit, health checks, etc.).
+    Without threading, a single long-lived SSE connection holds the only
+    server thread and every subsequent request hangs until the SSE ends.
+    """
+    daemon_threads    = True   # threads die when main process exits — no zombie threads
+    allow_reuse_address = True  # avoids "address already in use" on rapid restarts
+
+
+def run(server_class=ThreadingHTTPServer, handler_class=EnhancedApiHandler, port=8001):
     """Start server with error handling"""
     try:
         server_address = (
