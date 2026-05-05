@@ -1784,7 +1784,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
 
             # ── MODE B: legacy direct check-in — only read partner here ──────────
             user_data = execute_odoo_kw_optimized(
-                'res.partner', 'read', [int(user_id), ['name', 'phone', 'email']],
+                'res.partner', 'read', [int(user_id), ['name', 'phone', 'email', 'last_name']],
             )[0]
 
             visit_data = {
@@ -1792,7 +1792,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 'phone':     data.get('phone', user_data.get('phone', '')),
                 'email':     data.get('email', user_data.get('email', '')),
                 'user_id':   str(user_id),
-                'last_name': data.get('last_name', ''),
+                'last_name': data.get('last_name', user_data.get('last_name', '')),
                 'mobile':    data.get('mobile', data.get('phone', user_data.get('phone', ''))),
                 'entered':   True,
             }
