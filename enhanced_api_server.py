@@ -1752,7 +1752,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                     try:
                         user_data = execute_odoo_kw_optimized(
                             'res.partner', 'read',
-                            [int(user_id), ['name', 'phone', 'email', 'lang']],
+                            [int(user_id), ['name', 'last_name', 'phone', 'email', 'lang']],
                         )[0]
                     except Exception:
                         user_data = {}
@@ -1760,6 +1760,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                         'partner_id':   int(user_id),
                         'partner_name': user_data.get('name', ''),
                         'first_name':   (user_data.get('name') or '').split()[0],
+                        'last_name':   (user_data.get('last_name') or ''),
                         'lang':         user_data.get('lang', 'en_US'),
                     }
 
@@ -1781,12 +1782,12 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                     **partner_data,
                 }, 200)
                 return
+                
 
             # ── MODE B: legacy direct check-in — only read partner here ──────────
             user_data = execute_odoo_kw_optimized(
                 'res.partner', 'read', [int(user_id), ['name', 'phone', 'email', 'last_name']],
             )[0]
-
             visit_data = {
                 'name':      data.get('name',  user_data.get('name',  'Anonymous Visit')),
                 'phone':     data.get('phone', user_data.get('phone', '')),
@@ -1796,8 +1797,26 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 'mobile':    data.get('mobile', data.get('phone', user_data.get('phone', ''))),
                 'entered':   True,
             }
-            if data.get('warehouse_id'):
-                visit_data['warehouse_id'] = data['warehouse_id']
+            raw_wh = data.get('warehouse_id')
+            if raw_wh:
+                wh_id = None
+                # Case 1: numeric string or int — already an Odoo id
+                try:
+                    wh_id = int(raw_wh)
+                except (TypeError, ValueError):
+                    # Case 2: code/name string — resolve via stock.warehouse search
+                    wh = execute_odoo_kw_optimized(
+                        'stock.warehouse', 'search_read',
+                        [['|', ('code', '=', raw_wh), ('name', '=', raw_wh)], ['id']],
+                        {'limit': 1},
+                    )
+                    if wh:
+                        wh_id = wh[0]['id']
+                    else:
+                        logger.warning("Door QR warehouse_id %r not found in stock.warehouse", raw_wh)
+
+                if wh_id:
+                    visit_data['warehouse_id'] = wh_id
 
             visit_id = execute_odoo_kw_optimized('store.visit', 'create', [visit_data])
             logger.info(f"Store visit created (legacy mode): id={visit_id} user={user_id}")
