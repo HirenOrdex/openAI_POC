@@ -1477,14 +1477,14 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
             current_time = int(time.time())
             refresh_exp  = current_time + (365 * 24 * 3600)  # 365 days
 
-            # Short-lived access token (3 hours)
+            # Long-lived access token (365 days) for mobile sessions
             access_payload = {
                 'user_id': user_id,
                 'phone':   user.get('phone'),
                 'email':   user.get('email'),
                 'name':    user.get('name'),
                 'iat':     current_time,
-                'exp':     current_time + 10800,
+                'exp':     current_time + (365 * 24 * 3600),
                 'type':    'access'
             }
 
@@ -1513,7 +1513,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 'session_id':    session_id,
                 'user_id':       user_id,
                 'data':          user,
-                'expires_in':    10800
+                'expires_in':    365 * 24 * 3600
             }, 200)
         except Exception as e:
             logger.error(f"❌ VERIFY EXCEPTION: {str(e)}", exc_info=True)
@@ -2197,7 +2197,7 @@ class EnhancedApiHandler(http.server.BaseHTTPRequestHandler):
                 'email':   user.get('email'),
                 'name':    user.get('name'),
                 'iat':     current_time,
-                'exp':     current_time + 10800,        # 3 h
+                'exp':     current_time + (365 * 24 * 3600),  # 365 d
                 'type':    'access'
             }
             new_refresh_payload = {
